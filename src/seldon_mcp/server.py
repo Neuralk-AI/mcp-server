@@ -19,11 +19,13 @@ from seldon_mcp.metrics import compute_classification_metrics, compute_regressio
 logger = logging.getLogger("seldon_mcp")
 
 
-def _sanitize_error(e: Exception, config: SeldonConfig) -> str:
-    """Return an error message with the API key redacted."""
+def _sanitize_error(e: Exception, config: SeldonConfig, request_api_key: str | None = None) -> str:
+    """Return an error message with any API keys redacted."""
     msg = str(e)
     if config.neuralk_api_key and config.neuralk_api_key in msg:
         msg = msg.replace(config.neuralk_api_key, "***")
+    if request_api_key and request_api_key in msg:
+        msg = msg.replace(request_api_key, "***")
     return msg
 
 SELDON_MODELS = [
@@ -118,6 +120,14 @@ API_KEY_HEADER = "x-neuralk-api-key"
 
 def _get_config(ctx: Context) -> SeldonConfig:
     return ctx.request_context.lifespan_context["config"]
+
+
+def _get_request_api_key(ctx: Context) -> str | None:
+    """Extract the per-request API key from HTTP headers, if present."""
+    request = ctx.request_context.request
+    if request is not None:
+        return request.headers.get(API_KEY_HEADER)
+    return None
 
 
 def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
@@ -255,6 +265,7 @@ async def predict(
         random_state: Random seed for the holdout split. Defaults to 42.
     """
     config = _get_config(ctx)
+    req_key = _get_request_api_key(ctx)
 
     try:
         context_df = await anyio.to_thread.run_sync(
@@ -317,9 +328,9 @@ async def predict(
     except (FileNotFoundError, ValueError) as e:
         return json.dumps({"error": str(e)})
     except NeuralkException as e:
-        return json.dumps({"error": f"Neuralk API error: {_sanitize_error(e, config)}"})
+        return json.dumps({"error": f"Neuralk API error: {_sanitize_error(e, config, req_key)}"})
     except Exception as e:
-        return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config)}"})
+        return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
 
 
 @mcp.tool()
@@ -351,6 +362,7 @@ async def evaluate(
         random_state: Random seed for the holdout split. Defaults to 42.
     """
     config = _get_config(ctx)
+    req_key = _get_request_api_key(ctx)
 
     try:
         context_df = await anyio.to_thread.run_sync(
@@ -399,9 +411,9 @@ async def evaluate(
     except (FileNotFoundError, ValueError) as e:
         return json.dumps({"error": str(e)})
     except NeuralkException as e:
-        return json.dumps({"error": f"Neuralk API error: {_sanitize_error(e, config)}"})
+        return json.dumps({"error": f"Neuralk API error: {_sanitize_error(e, config, req_key)}"})
     except Exception as e:
-        return json.dumps({"error": f"Evaluation failed: {_sanitize_error(e, config)}"})
+        return json.dumps({"error": f"Evaluation failed: {_sanitize_error(e, config, req_key)}"})
 
 
 @mcp.tool()
