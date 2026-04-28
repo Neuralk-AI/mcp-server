@@ -12,6 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from neuralk import NeuralkException, Seldon, SeldonClassifier, SeldonRegressor
 from sklearn.model_selection import train_test_split
 
+from seldon_mcp.auth import APIKeyAuthError, _SkipValidation, validate_api_key
 from seldon_mcp.config import SeldonConfig
 from seldon_mcp.data_loader import describe_dataframe, load_dataframe
 from seldon_mcp.metrics import compute_classification_metrics, compute_regression_metrics
@@ -73,6 +74,25 @@ async def app_lifespan(server: FastMCP):
     config = SeldonConfig()
     _lifespan_config = config
     logger.info("Seldon MCP server started")
+    if config.neuralk_api_key and not config.skip_api_key_validation:
+        try:
+            result = await validate_api_key(
+                config.neuralk_api_key,
+                base_url=config.neuralk_api_base_url,
+                ttl_s=config.api_key_validation_ttl_s,
+                timeout_s=config.api_key_validation_timeout_s,
+            )
+            logger.info(
+                "Server-level Neuralk API key validated (org=%s, key=%s, scopes=%s)",
+                result.organization_id, result.key_name, ",".join(result.scopes),
+            )
+        except APIKeyAuthError as exc:
+            logger.error("Server-level NEURALK_API_KEY rejected by auth API: %s", exc)
+        except _SkipValidation:
+            logger.warning(
+                "Could not pre-validate server-level NEURALK_API_KEY (auth API unreachable); "
+                "validation will be retried on first tool call."
+            )
     try:
         yield {"config": config}
     finally:
@@ -130,16 +150,12 @@ def _get_request_api_key(ctx: Context) -> str | None:
     return None
 
 
-def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
+def _resolve_api_key(ctx: Context, config: SeldonConfig) -> str:
     """Resolve the Neuralk API key: per-request header > server env var."""
-    # Check for per-user key in HTTP header (SSE / streamable-http transports)
-    request = ctx.request_context.request
-    if request is not None:
-        header_key = request.headers.get(API_KEY_HEADER)
-        if header_key:
-            return header_key
+    header_key = _get_request_api_key(ctx)
+    if header_key:
+        return header_key
 
-    # Fall back to server-level key
     if config.neuralk_api_key:
         return config.neuralk_api_key
 
@@ -149,10 +165,39 @@ def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
     )
 
 
+async def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
+    """Resolve and validate the Neuralk API key against the saas auth API.
+
+    Validation hits ``GET /api/v1/auth/whoami`` and is cached per-key with a
+    short TTL. Network failures fail-open (the SDK call will surface the real
+    error). 401/403 raises a ``ValueError`` so the MCP tool returns a clear
+    error message to the client instead of a cryptic SDK traceback.
+    """
+    api_key = _resolve_api_key(ctx, config)
+
+    if config.skip_api_key_validation:
+        return api_key
+
+    try:
+        await validate_api_key(
+            api_key,
+            base_url=config.neuralk_api_base_url,
+            ttl_s=config.api_key_validation_ttl_s,
+            timeout_s=config.api_key_validation_timeout_s,
+        )
+    except APIKeyAuthError as exc:
+        raise ValueError(str(exc)) from exc
+    except _SkipValidation:
+        # neuralk-saas unreachable; let the SDK surface the real error
+        pass
+
+    return api_key
+
+
 VALID_TASK_TYPES = {"classification", "regression"}
 
 
-def _make_seldon(
+async def _make_seldon(
     ctx: Context, config: SeldonConfig, model: str | None = None, task_type: str | None = None,
 ) -> Seldon | SeldonClassifier | SeldonRegressor:
     """Create a Seldon instance with the resolved API key.
@@ -160,7 +205,7 @@ def _make_seldon(
     If task_type is specified, returns the corresponding estimator directly.
     Otherwise returns the auto-detecting Seldon convenience class.
     """
-    api_key = _get_api_key(ctx, config)
+    api_key = await _get_api_key(ctx, config)
     kwargs: dict[str, Any] = {"api_key": api_key}
     if config.neuralk_host:
         kwargs["host"] = config.neuralk_host
@@ -291,7 +336,7 @@ async def predict(
                 X_context, y_context, test_size=holdout_size, random_state=random_state,
             )
 
-        seldon = _make_seldon(ctx, config, model, task_type=task_type)
+        seldon = await _make_seldon(ctx, config, model, task_type=task_type)
 
         def _fit_predict():
             seldon.fit(X_context, y_context)
@@ -384,7 +429,7 @@ async def evaluate(
                 X_context, y_context, test_size=holdout_size, random_state=random_state,
             )
 
-        seldon = _make_seldon(ctx, config, model, task_type=task_type)
+        seldon = await _make_seldon(ctx, config, model, task_type=task_type)
 
         def _fit_predict():
             seldon.fit(X_context, y_context)
