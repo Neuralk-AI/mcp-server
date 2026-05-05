@@ -32,9 +32,22 @@ Set via environment variables or a `.env` file in the project directory:
 | Variable | Default | Description |
 |---|---|---|
 | `NEURALK_API_KEY` | `None` | Server-level API key (optional if clients provide their own via header) |
-| `NEURALK_HOST` | `None` (cloud) | On-premise server URL |
+| `NEURALK_API_BASE_URL` | `https://api.prediction.neuralk-ai.com` | Base URL of the Neuralk SaaS auth API used to validate keys |
+| `NEURALK_HOST` | `None` (cloud) | On-premise server URL for the inference SDK |
 | `SELDON_DEFAULT_MODEL` | `seldon-small` | Default model variant |
 | `SELDON_DATA_DIR` | `.` | Base directory for resolving relative file paths |
+| `SKIP_API_KEY_VALIDATION` | `false` | Disable upfront key validation (not recommended) |
+| `API_KEY_VALIDATION_TTL_S` | `300` | Cache TTL for successful whoami responses |
+| `API_KEY_VALIDATION_TIMEOUT_S` | `5.0` | HTTP timeout for the whoami request |
+
+### API key validation
+
+Before any `predict` or `evaluate` call, the resolved API key is validated
+against `GET {NEURALK_API_BASE_URL}/api/v1/auth/whoami`. This catches
+revoked / invalid / expired keys with a clear MCP error rather than letting
+the SDK fail mid-inference. Successful responses are cached in-process for
+`API_KEY_VALIDATION_TTL_S` seconds. If the auth API is unreachable, the
+validation step is skipped (fail-open) and the SDK call surfaces the error.
 
 ## Connect to an MCP client
 
