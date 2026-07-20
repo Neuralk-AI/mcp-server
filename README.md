@@ -14,14 +14,19 @@ Seldon uses in-context learning: you provide labeled examples as context and it 
 
 ### Install and run
 
-```bash
-git clone https://github.com/neuralk-ai/seldon-mcp.git
-cd seldon-mcp
-uv sync
-```
+Run the server directly from GitHub with [uv](https://docs.astral.sh/uv/) — no clone required:
 
 ```bash
 export NEURALK_API_KEY=nk_live_...
+uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp
+```
+
+For local development, clone the repo instead:
+
+```bash
+git clone https://github.com/Neuralk-AI/mcp-server.git
+cd mcp-server
+uv sync
 uv run seldon-mcp
 ```
 
@@ -59,8 +64,8 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 {
   "mcpServers": {
     "seldon": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/seldon-mcp", "run", "seldon-mcp"],
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/Neuralk-AI/mcp-server", "seldon-mcp"],
       "env": {
         "NEURALK_API_KEY": "nk_live_..."
       }
@@ -72,7 +77,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 ### Claude Code
 
 ```bash
-claude mcp add seldon -- uv --directory /path/to/seldon-mcp run seldon-mcp
+claude mcp add seldon -- uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp
 ```
 
 ### Remote (SSE)
