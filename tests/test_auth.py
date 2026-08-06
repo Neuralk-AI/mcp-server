@@ -117,3 +117,29 @@ async def test_validate_skips_on_5xx(patch_client):
 
     with pytest.raises(_SkipValidation):
         await validate_api_key("nk_live_good", "https://api.example.com")
+
+
+@pytest.mark.asyncio
+async def test_validate_skips_on_404(patch_client):
+    # An unexpected 404 (e.g. whoami not served on this host) must fail open rather
+    # than hard-reject a possibly-valid key.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="not found")
+
+    patch_client(handler)
+
+    with pytest.raises(_SkipValidation):
+        await validate_api_key("nk_live_good", "https://api.example.com")
+
+
+@pytest.mark.asyncio
+async def test_validate_403_non_dict_body_does_not_crash(patch_client):
+    # A 403 with a JSON list/scalar body must not raise AttributeError; it should
+    # surface the default terms/permission message.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json=["nope"])
+
+    patch_client(handler)
+
+    with pytest.raises(APIKeyAuthError, match="rejected|terms of service"):
+        await validate_api_key("nk_live_bad", "https://api.example.com")
