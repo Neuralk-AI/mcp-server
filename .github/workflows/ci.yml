@@ -51,6 +51,7 @@ jobs:
           uv run python -c "
           from seldon_mcp.server import mcp
           tools = [t.name for t in mcp._tool_manager.list_tools()]
-          assert set(tools) == {'describe_data', 'predict', 'evaluate', 'list_models'}, f'Unexpected tools: {tools}'
+          expected = {'predict', 'predict_from_data', 'upload_data', 'create_upload', 'complete_upload', 'list_models'}
+          assert set(tools) == expected, f'Unexpected tools: {tools}'
           print('Server OK:', tools)
           "
