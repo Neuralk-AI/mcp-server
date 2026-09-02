@@ -10,7 +10,11 @@ image:
   # Built by .github/workflows/image.yml (linux/amd64). Every build of main
   # carries a main-<sha> tag, so this line maps to a commit and a rollback is a
   # line in a diff. Pin releases here; never deploy :latest.
-  tag: main-0000000
+  #
+  # git-26d4f0a: built by hand from feat/hosted-mcp on 2026-09-02, before the
+  # branch reached main (deploy/README.md step 1). The first CI build of main
+  # replaces it with a main-<sha> tag.
+  tag: git-26d4f0a
 
 # rg.fr-par.scw.cloud/neuralk-prod is PRIVATE. This secret must exist in the
 # release namespace before the pods do (deploy/README.md).

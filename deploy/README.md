@@ -31,11 +31,12 @@ one repository secret, `SCW_REGISTRY_SECRET_KEY`: the secret key of the
 Scaleway IAM application **`seldon-mcp-ci`**, whose only policy is
 `ContainerRegistryFullAccess` on the Production project.
 
-To build by hand (Apple Silicon: the nodes are x86, build for them):
+To build by hand (Apple Silicon: the nodes are x86, build for them), tag it
+`git-<sha>` so it is never mistaken for a CI build of `main`:
 
 ```bash
 docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
-  -t rg.fr-par.scw.cloud/neuralk-prod/seldon-mcp:main-$(git rev-parse --short HEAD) --push .
+  -t rg.fr-par.scw.cloud/neuralk-prod/seldon-mcp:git-$(git rev-parse --short HEAD) --push .
 ```
 
 ### 2. The namespace and the pull secret
