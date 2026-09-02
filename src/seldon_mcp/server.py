@@ -1,23 +1,26 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import csv
 import io
 import json
 import logging
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import anyio
 import click
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from neuralk.exceptions import NeuralkException, NeuralkTermsNotAcceptedError
+from starlette.datastructures import Headers
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from seldon_mcp import dataset, neuralk_sdk
 from seldon_mcp.auth import APIKeyAuthError, _SkipValidation, validate_api_key
@@ -110,62 +113,106 @@ def _validate_params(
 
 _lifespan_config: SeldonConfig | None = None
 _download_store: DownloadStore | None = None
+_server_key_checked = False
 
 
-async def _download_sweeper(store: DownloadStore, interval: int = 60) -> None:
-    """Periodically delete expired download files (belt to the serve-time braces)."""
-    while True:
-        try:
-            await anyio.sleep(interval)
-            await anyio.to_thread.run_sync(store.sweep)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("download sweep failed")
+def _init_state(config: SeldonConfig | None = None) -> SeldonConfig:
+    """Create the process-wide configuration and download store, once.
+
+    The CLI calls this before serving; the first session's lifespan calls it as
+    a fallback (tests and embedders that never go through the CLI). It is
+    idempotent: a second call returns what the first one built.
+
+    Nothing built here is ever torn down while the process serves. Over HTTP
+    the MCP lifespan runs once per client session — once per request in
+    stateless mode — so a teardown at the end of one session would pull the
+    download store from under every other session still answering.
+
+    Args:
+        config: Configuration to install. Defaults to reading the environment.
+
+    Returns:
+        The process-wide configuration.
+    """
+    global _lifespan_config, _download_store
+    if _lifespan_config is None:
+        _lifespan_config = config or SeldonConfig()
+    if _download_store is None:
+        cfg = _lifespan_config
+        download_dir = cfg.seldon_download_dir or str(Path(tempfile.gettempdir()) / "seldon-mcp-downloads")
+        _download_store = DownloadStore(download_dir, ttl_seconds=cfg.seldon_download_ttl_seconds)
+        _download_store.sweep()  # clear anything left over from a previous run
+        logger.info("Download store: %s (files live %ss)", download_dir, cfg.seldon_download_ttl_seconds)
+    return _lifespan_config
+
+
+def _start_download_sweeper(store: DownloadStore, interval: int = 60) -> threading.Thread:
+    """Start the daemon thread that deletes expired download files.
+
+    A belt to the serve-time braces: files are also deleted when served and
+    swept on every save, so the thread only reclaims files nobody fetched.
+
+    Args:
+        store: The download store to sweep.
+        interval: Seconds between sweeps.
+
+    Returns:
+        The started thread.
+    """
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                store.sweep()
+            except Exception:  # noqa: BLE001 - a sweep must never kill the thread
+                logger.exception("download sweep failed")
+
+    thread = threading.Thread(target=_loop, name="seldon-mcp-download-sweeper", daemon=True)
+    thread.start()
+    return thread
+
+
+async def _check_server_key_once(config: SeldonConfig) -> None:
+    """Pre-validate the server-level key, once per process, log only.
+
+    Per-request keys are validated on the tool call that uses them.
+    """
+    global _server_key_checked
+    if _server_key_checked or not config.neuralk_api_key or config.skip_api_key_validation:
+        return
+    _server_key_checked = True
+    try:
+        result = await validate_api_key(
+            config.neuralk_api_key,
+            base_url=config.neuralk_prediction_url,
+            ttl_s=config.api_key_validation_ttl_s,
+            timeout_s=config.api_key_validation_timeout_s,
+        )
+        logger.info(
+            "Server-level Neuralk API key validated (org=%s, key=%s, scopes=%s)",
+            result.organization_id, result.key_name, ",".join(result.scopes),
+        )
+    except APIKeyAuthError as exc:
+        logger.error("Server-level NEURALK_API_KEY rejected by auth API: %s", exc)
+    except _SkipValidation:
+        logger.warning(
+            "Could not pre-validate server-level NEURALK_API_KEY (auth API unreachable); "
+            "validation will be retried on first tool call."
+        )
 
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
-    """Initialize configuration and the download store at server startup."""
-    global _lifespan_config, _download_store
-    config = SeldonConfig()
-    _lifespan_config = config
-    download_dir = config.seldon_download_dir or str(Path(tempfile.gettempdir()) / "seldon-mcp-downloads")
-    _download_store = DownloadStore(download_dir, ttl_seconds=config.seldon_download_ttl_seconds)
-    _download_store.sweep()  # clear anything left over from a previous run
-    sweeper = asyncio.create_task(_download_sweeper(_download_store))
-    logger.info("Seldon MCP server started (downloads dir: %s)", download_dir)
-    # Best-effort pre-validation of the server-level key (log only; per-request
-    # keys are validated on the tool call). Reuses the prediction URL as the
-    # auth base — /api/v1/auth/whoami lives on the same host.
-    if config.neuralk_api_key and not config.skip_api_key_validation:
-        try:
-            result = await validate_api_key(
-                config.neuralk_api_key,
-                base_url=config.neuralk_prediction_url,
-                ttl_s=config.api_key_validation_ttl_s,
-                timeout_s=config.api_key_validation_timeout_s,
-            )
-            logger.info(
-                "Server-level Neuralk API key validated (org=%s, key=%s, scopes=%s)",
-                result.organization_id, result.key_name, ",".join(result.scopes),
-            )
-        except APIKeyAuthError as exc:
-            logger.error("Server-level NEURALK_API_KEY rejected by auth API: %s", exc)
-        except _SkipValidation:
-            logger.warning(
-                "Could not pre-validate server-level NEURALK_API_KEY (auth API unreachable); "
-                "validation will be retried on first tool call."
-            )
-    try:
-        yield {"config": config}
-    finally:
-        sweeper.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sweeper
-        _download_store = None
-        _lifespan_config = None
-        logger.info("Seldon MCP server shutting down")
+    """Hand each MCP session the process-wide configuration.
+
+    Runs once per session: once per process over stdio, once per client
+    session over HTTP, once per request in stateless HTTP mode. State is built
+    by ``_init_state`` (idempotent) and deliberately not torn down here.
+    """
+    config = _init_state()
+    await _check_server_key_once(config)
+    yield {"config": config}
 
 
 mcp = FastMCP(
@@ -203,33 +250,69 @@ Key things to know:
 
 
 API_KEY_HEADER = "x-neuralk-api-key"
+AUTHORIZATION_HEADER = "authorization"
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def _get_config(ctx: Context) -> SeldonConfig:
     return ctx.request_context.lifespan_context["config"]
 
 
+def _api_key_from_headers(headers: Any) -> str | None:
+    """Read the client's Neuralk API key from HTTP headers.
+
+    Two spellings are accepted: the ``x-neuralk-api-key`` header, and the
+    MCP-conventional ``Authorization: Bearer <key>``, so any client that can
+    send one static header can connect.
+
+    Args:
+        headers: A mapping with ``get`` (Starlette headers or a plain dict).
+
+    Returns:
+        The key, or None when neither header carries one.
+    """
+    key = headers.get(API_KEY_HEADER)
+    if key and key.strip():
+        return key.strip()
+    auth = headers.get(AUTHORIZATION_HEADER) or headers.get("Authorization") or ""
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return None
+
+
 def _get_request_api_key(ctx: Context) -> str | None:
     """Extract the per-request API key from HTTP headers, if present."""
     request = ctx.request_context.request
     if request is not None:
-        return request.headers.get(API_KEY_HEADER)
+        return _api_key_from_headers(request.headers)
     return None
 
 
 def _resolve_api_key(ctx: Context, config: SeldonConfig) -> str:
-    """Resolve the Neuralk API key: per-request header > server env var."""
+    """Resolve the Neuralk API key: per-request header > server env var.
+
+    With ``require_client_api_key`` set (the hosted deployment), the server's
+    own key is never used on a client's behalf: a request without a key is an
+    error that names the headers to send.
+    """
     header_key = _get_request_api_key(ctx)
     if header_key:
         return header_key
 
+    if config.require_client_api_key:
+        raise ValueError(
+            "This server needs your own Neuralk API key on every request: send it as the "
+            f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. Create a key at "
+            "https://prediction.neuralk-ai.com/dashboard/api-keys."
+        )
     if config.neuralk_api_key:
         return config.neuralk_api_key
     raise ValueError(
         "No Neuralk API key provided. Either set NEURALK_API_KEY on the server "
-        f"or pass it via the '{API_KEY_HEADER}' HTTP header."
+        f"or pass it via the '{API_KEY_HEADER}' HTTP header (or 'Authorization: Bearer <key>')."
     )
-
 
 async def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
     """Resolve and validate the Neuralk API key against the saas auth API.
@@ -350,7 +433,11 @@ async def _attach_download(ctx: Context, result: dict, predictions: list, probab
         return
     store = _download_store
     token = await anyio.to_thread.run_sync(lambda: store.save(_predictions_csv(predictions, probabilities)))
-    result["download_url"] = f"{str(request.base_url).rstrip('/')}/downloads/{token}"
+    # Behind an ingress the request's own base URL is the pod's view (plain
+    # http, whatever Host the proxy forwarded); SELDON_PUBLIC_URL is the address
+    # a client can actually fetch from.
+    base_url = _get_config(ctx).public_url or str(request.base_url)
+    result["download_url"] = f"{base_url.rstrip('/')}/downloads/{token}"
     result["download_note"] = (
         f"All {len(predictions)} predictions as CSV. Single-use link; expires in "
         f"{store.ttl_seconds // 60} min or when downloaded."
@@ -819,7 +906,13 @@ def drop_and_predict(file_path: str, target_column: str) -> str:
     )
 
 
-# --- HTTP download route ---
+# --- HTTP routes ---
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> Response:
+    """Liveness and readiness probe: the process is up and serving."""
+    return PlainTextResponse("ok")
 
 
 @mcp.custom_route("/downloads/{token}", methods=["GET"])
@@ -839,23 +932,86 @@ async def download_predictions(request: Request) -> Response:
     )
 
 
-# --- CLI ---
+class RequireClientKeyMiddleware:
+    """Refuse MCP requests that carry no client API key (ASGI middleware).
 
-
-def _run_streamable_http_both_paths(host: str, port: int) -> None:
-    """Serve the streamable-http MCP endpoint at BOTH the configured path
-    (default /mcp) and the root path /, so clients connecting with either the
-    bare host URL or the /mcp URL both work.
-
-    The MCP endpoint is registered as an exact-match Starlette Route, so adding
-    a second Route at "/" pointing at the same ASGI handler does not interfere
-    with any other routes.
+    The hosted deployment sets ``REQUIRE_CLIENT_API_KEY=true``: this server
+    holds no Neuralk key of its own, so an MCP request without one cannot do
+    anything useful and is answered ``401`` up front, naming the two accepted
+    headers. ``/healthz`` and the single-use ``/downloads`` links are not MCP
+    requests and pass through.
     """
-    import uvicorn
-    from starlette.routing import Route
 
+    def __init__(self, app: Any, mcp_paths: set[str]) -> None:
+        self.app = app
+        self.mcp_paths = {p.rstrip("/") or "/" for p in mcp_paths}
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "").rstrip("/") or "/"
+            if path in self.mcp_paths and not _api_key_from_headers(Headers(scope=scope)):
+                response = JSONResponse(
+                    {
+                        "error": (
+                            "A Neuralk API key is required. Send it as the "
+                            f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. "
+                            "Create a key at https://prediction.neuralk-ai.com/dashboard/api-keys."
+                        )
+                    },
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="neuralk"'},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _configure_binding(host: str, port: int) -> None:
+    """Point FastMCP at the bind address and fix its transport security for it.
+
+    FastMCP turns DNS-rebinding protection on at construction because its
+    default host is loopback, and that protection accepts only loopback Host
+    headers. Behind an ingress every request carries the public name, so on a
+    non-loopback bind the check is turned off: the ingress in front is what
+    decides who reaches this process. On loopback the protection stays.
+    """
     mcp.settings.host = host
     mcp.settings.port = port
+    if host not in _LOOPBACK_HOSTS:
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+def build_http_app(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    *,
+    stateless: bool = True,
+    json_response: bool = True,
+):
+    """Build the ASGI app of the hosted server.
+
+    Serves the Streamable HTTP MCP endpoint at ``/mcp`` and at ``/`` (so a
+    client given either the bare host or the ``/mcp`` URL works), ``/healthz``
+    for probes and ``/downloads/<token>`` for large prediction sets. With
+    ``require_client_api_key`` set, MCP requests without a key are refused.
+
+    Args:
+        host: Address the server will bind (decides the transport security).
+        port: Port the server will bind.
+        stateless: No session state between requests, so any replica can
+            answer any request — the mode to run behind a load balancer.
+        json_response: Answer tool calls with a JSON body instead of an event
+            stream; simpler through proxies that buffer.
+
+    Returns:
+        The Starlette application.
+    """
+    from starlette.routing import Route
+
+    config = _init_state()
+    _configure_binding(host, port)
+    mcp.settings.stateless_http = stateless
+    mcp.settings.json_response = json_response
 
     app = mcp.streamable_http_app()
     mcp_path = mcp.settings.streamable_http_path
@@ -863,8 +1019,35 @@ def _run_streamable_http_both_paths(host: str, port: int) -> None:
         mcp_route = next(r for r in app.routes if getattr(r, "path", None) == mcp_path)
         # Reuse the exact same ASGI endpoint so / behaves identically to /mcp.
         app.router.routes.append(Route("/", endpoint=mcp_route.endpoint))
+    if config.require_client_api_key:
+        app.add_middleware(RequireClientKeyMiddleware, mcp_paths={mcp_path, "/"})
+    return app
 
-    uvicorn.run(app, host=host, port=port, log_level=mcp.settings.log_level.lower())
+
+def _serve_streamable_http(
+    host: str, port: int, *, stateless: bool, json_response: bool, forwarded_allow_ips: str
+) -> None:
+    """Run the hosted server under uvicorn."""
+    import uvicorn
+
+    app = build_http_app(host, port, stateless=stateless, json_response=json_response)
+    assert _download_store is not None  # built by build_http_app
+    _start_download_sweeper(_download_store)
+    logger.info(
+        "Serving Streamable HTTP on %s:%s (stateless=%s, json_response=%s, client key required=%s)",
+        host, port, stateless, json_response, bool(_lifespan_config and _lifespan_config.require_client_api_key),
+    )
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=mcp.settings.log_level.lower(),
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips,
+    )
+
+
+# --- CLI ---
 
 
 @click.command()
@@ -876,18 +1059,45 @@ def _run_streamable_http_both_paths(host: str, port: int) -> None:
 )
 @click.option("--host", type=str, default="127.0.0.1", help="Host to bind for SSE/HTTP transport.")
 @click.option("--port", type=int, default=8000, help="Port for SSE/HTTP transport.")
-def main(transport: str, host: str, port: int):
+@click.option(
+    "--stateless/--stateful",
+    default=True,
+    help="Streamable HTTP only: keep no session state between requests, so any replica can answer "
+    "any request (the mode to run behind a load balancer). Default: stateless.",
+)
+@click.option(
+    "--json-response/--sse-response",
+    default=True,
+    help="Streamable HTTP only: answer tool calls with a plain JSON body instead of an event stream. "
+    "Default: JSON.",
+)
+@click.option(
+    "--forwarded-allow-ips",
+    type=str,
+    default="127.0.0.1",
+    help="Proxies whose X-Forwarded-* headers are trusted (uvicorn's setting). "
+    "Use '*' behind an ingress you control.",
+)
+def main(
+    transport: str,
+    host: str,
+    port: int,
+    stateless: bool,
+    json_response: bool,
+    forwarded_allow_ips: str,
+) -> None:
     """Start the Seldon MCP server."""
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    _init_state()
 
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "streamable-http":
-        # Serve at both / and /mcp for client-URL flexibility.
-        _run_streamable_http_both_paths(host, port)
+        _serve_streamable_http(
+            host, port, stateless=stateless, json_response=json_response, forwarded_allow_ips=forwarded_allow_ips
+        )
     else:
-        mcp.settings.host = host
-        mcp.settings.port = port
+        _configure_binding(host, port)
         mcp.run(transport=transport)
 
 

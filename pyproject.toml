@@ -1,6 +1,6 @@
 [project]
 name = "seldon-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Neuralk's Seldon tabular foundation model"
 readme = "README.md"
 authors = [
@@ -24,6 +24,7 @@ dependencies = [
     "skrub>=0.5",
     "zstandard>=0.22",
     "numpy>=1.26",
+    "uvicorn>=0.31",
 ]
 
 [project.scripts]

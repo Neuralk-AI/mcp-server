@@ -1838,7 +1838,7 @@ wheels = [
 
 [[package]]
 name = "seldon-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -1854,6 +1854,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "scikit-learn" },
     { name = "skrub" },
+    { name = "uvicorn" },
     { name = "zstandard" },
 ]
 
@@ -1881,6 +1882,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "scikit-learn", specifier = ">=1.6" },
     { name = "skrub", specifier = ">=0.5" },
+    { name = "uvicorn", specifier = ">=0.31" },
     { name = "zstandard", specifier = ">=0.22" },
 ]
 
