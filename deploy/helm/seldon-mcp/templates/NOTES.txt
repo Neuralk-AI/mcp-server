@@ -1,0 +1,30 @@
+Seldon MCP server — release {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+{{- $publicUrl := include "seldon-mcp.publicUrl" . }}
+{{- if .Values.ingress.enabled }}
+
+MCP endpoint:  {{ $publicUrl }}/mcp
+Health:        {{ $publicUrl }}/healthz
+
+Connect a client with its own Neuralk API key, for example:
+
+  claude mcp add --transport http seldon {{ $publicUrl }}/mcp \
+    --header "x-neuralk-api-key: nk_live_..."
+
+Watch the certificate and the rollout:
+
+  kubectl -n {{ .Release.Namespace }} get certificate,pods
+{{- else }}
+
+No ingress. Reach the server inside the cluster at
+http://{{ include "seldon-mcp.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/mcp
+or port-forward:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "seldon-mcp.fullname" . }} 8000:{{ .Values.service.port }}
+{{- end }}
+
+{{- if eq (toString .Values.config.REQUIRE_CLIENT_API_KEY) "true" }}
+
+Every MCP request must carry the client's key (x-neuralk-api-key or
+Authorization: Bearer). Requests without one are answered 401.
+{{- end }}

@@ -1,0 +1,36 @@
+# The Neuralk production deployment: https://mcp.neuralk.ai
+#
+#   helm upgrade --install seldon-mcp deploy/helm/seldon-mcp \
+#     -n seldon-mcp --create-namespace -f deploy/helm/seldon-mcp/values-neuralk.yaml
+#
+# Only what differs from values.yaml is here. The one thing that never lives in
+# git is the `scaleway-registry` pull secret, created out of band — deploy/README.md.
+
+image:
+  # Built by .github/workflows/image.yml (linux/amd64). Every build of main
+  # carries a main-<sha> tag, so this line maps to a commit and a rollback is a
+  # line in a diff. Pin releases here; never deploy :latest.
+  tag: main-0000000
+
+# rg.fr-par.scw.cloud/neuralk-prod is PRIVATE. This secret must exist in the
+# release namespace before the pods do (deploy/README.md).
+imagePullSecrets:
+  - name: scaleway-registry
+
+ingress:
+  enabled: true
+  host: mcp.neuralk.ai
+  annotations:
+    # The issuer the rest of the Neuralk platform uses (DNS-01, Cloudflare).
+    cert-manager.io/cluster-issuer: letsencrypt-prod-cloudflare
+
+# Keep the server off the GPU machines. `k8s.scw.cloud/gpu` is Kapsule's own
+# label, present on every GPU node and on nothing else, so DoesNotExist means
+# "any CPU node" and survives pools being added or renamed.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: k8s.scw.cloud/gpu
+              operator: DoesNotExist

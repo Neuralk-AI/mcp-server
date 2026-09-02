@@ -1,0 +1,114 @@
+# Default values for the Seldon MCP server.
+#
+# One Deployment serving the Streamable HTTP MCP endpoint, one Service, an
+# optional Ingress. The server holds no Neuralk key: every client sends its own
+# (REQUIRE_CLIENT_API_KEY below), and is billed on its own account.
+
+replicaCount: 1
+
+image:
+  repository: rg.fr-par.scw.cloud/neuralk-prod/seldon-mcp
+  # Empty = the chart's appVersion. Pin a build tag (main-<sha>) in an
+  # environment file; never deploy :latest.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The registry is private: name the pull secret of the release namespace.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The server's environment. Plain settings only — a credential named here is
+# refused at render time (see templates/deployment.yaml); it belongs in the
+# Secret named by existingSecret.
+config:
+  # Hosted mode: an MCP request without the client's key is answered 401.
+  REQUIRE_CLIENT_API_KEY: "true"
+  # Public base URL the download links are built from. Empty = derived from
+  # ingress.host when the ingress is on, else from each request.
+  SELDON_PUBLIC_URL: ""
+  NEURALK_PREDICTION_URL: https://api.prediction.neuralk-ai.com
+  SELDON_DEFAULT_MODEL: seldon-small
+  # Large prediction sets are written here and served once; the directory is
+  # the emptyDir below (the root filesystem is read-only).
+  SELDON_DOWNLOAD_DIR: /tmp/seldon-mcp-downloads
+  SELDON_DOWNLOAD_TTL_SECONDS: "300"
+
+# Optional Secret loaded with envFrom — the only way a credential reaches the
+# pod. A private deployment that bills one organisation puts NEURALK_API_KEY
+# there and sets config.REQUIRE_CLIENT_API_KEY to "false".
+existingSecret: ""
+
+server:
+  # No session state between requests: any replica answers any request.
+  stateless: true
+  # Tool calls answered with a JSON body rather than an event stream.
+  jsonResponse: true
+  # Proxies whose X-Forwarded-* headers are trusted. "*" behind your ingress.
+  forwardedAllowIps: "*"
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: false
+  className: nginx
+  # The public name, e.g. mcp.neuralk.ai. Required when enabled.
+  host: ""
+  annotations:
+    # A prediction can take minutes; the default 60 s would cut the answer.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Inline CSV in a tool call is bounded by the MCP client, not by us; 64 MiB
+    # leaves room without letting an anonymous POST park a gigabyte.
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+  tls:
+    enabled: true
+    secretName: seldon-mcp-tls
+
+# Where /downloads files live. An emptyDir by default — private to each pod,
+# which is why replicaCount is 1 unless a shared (ReadWriteMany) claim is named.
+downloads:
+  sizeLimit: 1Gi
+  existingClaim: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  # The server talks to nothing in the cluster.
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
