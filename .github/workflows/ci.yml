@@ -77,11 +77,25 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: The image serves the MCP endpoint
-        # Start the container exactly as production runs it, then check the
-        # probe and that an MCP request without a key is refused, not served.
+      - uses: azure/setup-helm@v4
+
+      - name: The image serves the MCP endpoint, started the way the chart starts it
+        # The container is started with the command and arguments the chart
+        # renders for production — not the image's own CMD. The first install
+        # failed on exactly that difference (the chart's args replaced the
+        # image's command and "--transport" was run as the executable), and the
+        # image's CMD had passed every test.
         run: |
-          docker run -d --name mcp -p 8000:8000 -e REQUIRE_CLIENT_API_KEY=true seldon-mcp:ci
+          read -r -a CMD <<< "$(helm template seldon-mcp deploy/helm/seldon-mcp -f deploy/helm/seldon-mcp/values-neuralk.yaml \
+            | python3 -c '
+          import sys, yaml
+          for doc in yaml.safe_load_all(sys.stdin):
+              if doc and doc.get("kind") == "Deployment":
+                  c = doc["spec"]["template"]["spec"]["containers"][0]
+                  print(" ".join(c.get("command", []) + c.get("args", [])))
+          ')"
+          echo "chart command: ${CMD[*]}"
+          docker run -d --name mcp -p 8000:8000 -e REQUIRE_CLIENT_API_KEY=true seldon-mcp:ci "${CMD[@]}"
           for i in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8000/healthz && break
             sleep 1

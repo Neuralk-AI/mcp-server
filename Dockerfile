@@ -42,7 +42,10 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
 
-# Stateless Streamable HTTP, JSON answers, X-Forwarded-* trusted: the settings
-# for running behind an ingress. Override the arguments for anything else.
-CMD ["seldon-mcp", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000", \
+# The binary is the entrypoint, the flags are the default arguments: a runtime
+# that passes its own arguments (Kubernetes `args`, `docker run image --flag`)
+# replaces the flags and keeps the binary. Stateless Streamable HTTP, JSON
+# answers, X-Forwarded-* trusted: the settings for running behind an ingress.
+ENTRYPOINT ["seldon-mcp"]
+CMD ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000", \
      "--stateless", "--json-response", "--forwarded-allow-ips", "*"]

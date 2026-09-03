@@ -81,6 +81,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          # `command` is set explicitly: Kubernetes `args` alone replaces the
+          # image's CMD, and the first install ran "--transport" as the
+          # executable ("file not found", 2026-09-03). Naming the binary here
+          # makes the chart independent of how the image declares it.
+          command:
+            - seldon-mcp
           args:
             - --transport
             - streamable-http
