@@ -34,6 +34,10 @@ config:
   # the emptyDir below (the root filesystem is read-only).
   SELDON_DOWNLOAD_DIR: /tmp/seldon-mcp-downloads
   SELDON_DOWNLOAD_TTL_SECONDS: "300"
+  # skrub creates its data directory at import time, under $HOME by default;
+  # with a read-only root filesystem that is a crash before the first log
+  # line (2026-09-03). Keep it in the one writable place.
+  SKB_DATA_DIRECTORY: /tmp/skrub_data
 
 # Optional Secret loaded with envFrom — the only way a credential reaches the
 # pod. A private deployment that bills one organisation puts NEURALK_API_KEY

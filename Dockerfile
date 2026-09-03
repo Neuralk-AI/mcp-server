@@ -27,9 +27,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --- runtime stage ------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
+# SKB_DATA_DIRECTORY: skrub creates its data directory at import time, under
+# $HOME by default, which a read-only root filesystem refuses. /tmp is the one
+# writable place the runtime is expected to provide.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    SKB_DATA_DIRECTORY=/tmp/skrub_data
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app
 

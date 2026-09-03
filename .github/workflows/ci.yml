@@ -95,7 +95,11 @@ jobs:
                   print(" ".join(c.get("command", []) + c.get("args", [])))
           ')"
           echo "chart command: ${CMD[*]}"
-          docker run -d --name mcp -p 8000:8000 -e REQUIRE_CLIENT_API_KEY=true seldon-mcp:ci "${CMD[@]}"
+          # --read-only and a tmpfs /tmp mirror the chart's securityContext: the
+          # root filesystem is read-only in production and /tmp is the one
+          # writable mount. A library writing anywhere else fails here, not there.
+          docker run -d --name mcp -p 8000:8000 --read-only --tmpfs /tmp --user 10001:10001 \
+            -e REQUIRE_CLIENT_API_KEY=true seldon-mcp:ci "${CMD[@]}"
           for i in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8000/healthz && break
             sleep 1
