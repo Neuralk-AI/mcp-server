@@ -38,6 +38,9 @@ config:
   # with a read-only root filesystem that is a crash before the first log
   # line (2026-09-03). Keep it in the one writable place.
   SKB_DATA_DIRECTORY: /tmp/skrub_data
+  # Same story for matplotlib (pulled in by skrub): without a writable config
+  # directory it warns at every start and re-derives its font cache.
+  MPLCONFIGDIR: /tmp/matplotlib
 
 # Optional Secret loaded with envFrom — the only way a credential reaches the
 # pod. A private deployment that bills one organisation puts NEURALK_API_KEY

@@ -95,16 +95,21 @@ jobs:
                   print(" ".join(c.get("command", []) + c.get("args", [])))
           ')"
           echo "chart command: ${CMD[*]}"
+          # Kubernetes semantics, exactly: `command` replaces the ENTRYPOINT and
+          # `args` replace the CMD. Passing the whole line as the docker
+          # command would append it to the image's own entrypoint.
           # --read-only and a tmpfs /tmp mirror the chart's securityContext: the
           # root filesystem is read-only in production and /tmp is the one
           # writable mount. A library writing anywhere else fails here, not there.
           docker run -d --name mcp -p 8000:8000 --read-only --tmpfs /tmp --user 10001:10001 \
-            -e REQUIRE_CLIENT_API_KEY=true seldon-mcp:ci "${CMD[@]}"
+            -e REQUIRE_CLIENT_API_KEY=true --entrypoint "${CMD[0]}" seldon-mcp:ci "${CMD[@]:1}"
           for i in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8000/healthz && break
             sleep 1
           done
-          curl -fsS http://127.0.0.1:8000/healthz
+          if ! curl -fsS http://127.0.0.1:8000/healthz; then
+            echo "the container never answered /healthz; its log:"; docker logs mcp; exit 1
+          fi
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp \
             -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')

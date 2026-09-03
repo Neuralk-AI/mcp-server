@@ -33,7 +33,8 @@ FROM python:3.11-slim AS runtime
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    SKB_DATA_DIRECTORY=/tmp/skrub_data
+    SKB_DATA_DIRECTORY=/tmp/skrub_data \
+    MPLCONFIGDIR=/tmp/matplotlib
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app
 
