@@ -53,6 +53,13 @@ class TestApiKeyFromHeaders:
     def test_x_neuralk_api_key_header(self):
         assert _api_key_from_headers({"x-neuralk-api-key": " nk_a "}) == "nk_a"
 
+    def test_generic_x_api_key_header(self):
+        # The header MCP hosting platforms (Alpic) forward for API-key auth.
+        assert _api_key_from_headers({"x-api-key": " nk_c "}) == "nk_c"
+
+    def test_neuralk_header_wins_over_generic(self):
+        assert _api_key_from_headers({"x-neuralk-api-key": "nk_a", "x-api-key": "nk_c"}) == "nk_a"
+
     def test_authorization_bearer(self):
         assert _api_key_from_headers({"authorization": "Bearer nk_b"}) == "nk_b"
 

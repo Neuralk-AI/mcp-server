@@ -128,6 +128,18 @@ without Docker. Defaults are the hosted ones: stateless (any replica answers any
 request), JSON answers (`--sse-response` for event streams),
 `--forwarded-allow-ips` for the proxies whose `X-Forwarded-*` headers to trust.
 
+### On Alpic
+
+[Alpic](https://alpic.ai) runs the server serverless from the repository:
+[`main.py`](main.py) is the entry point its default `uv run main.py` start
+command expects, and [`alpic.json`](alpic.json) pins the install command. Set
+`REQUIRE_CLIENT_API_KEY=true`, `SKB_DATA_DIRECTORY=/tmp/skrub_data` and
+`MPLCONFIGDIR=/tmp/matplotlib` (the runtime's root filesystem is read-only) in
+the environment's variables. Clients send their key as `x-api-key`,
+`x-neuralk-api-key` or `Authorization: Bearer`. Two limits of that runtime: a
+tool call is cut after 30 seconds, and only `/mcp` is routed, so the
+`/downloads/<token>` links for oversized prediction sets are not reachable there.
+
 ### On Kubernetes
 
 [`deploy/helm/seldon-mcp`](deploy/helm/seldon-mcp) is the chart, and
