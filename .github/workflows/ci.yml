@@ -51,6 +51,91 @@ jobs:
           uv run python -c "
           from seldon_mcp.server import mcp
           tools = [t.name for t in mcp._tool_manager.list_tools()]
-          assert set(tools) == {'describe_data', 'predict', 'evaluate', 'list_models'}, f'Unexpected tools: {tools}'
+          expected = {'predict', 'predict_from_data', 'upload_data', 'create_upload', 'complete_upload', 'list_models'}
+          assert set(tools) == expected, f'Unexpected tools: {tools}'
           print('Server OK:', tools)
           "
+
+  container:
+    # The image builds from a clean checkout — the same Dockerfile the Image
+    # workflow pushes from. No push here: a pull request proves it builds.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: seldon-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - uses: azure/setup-helm@v4
+
+      - name: The image serves the MCP endpoint, started the way the chart starts it
+        # The container is started with the command and arguments the chart
+        # renders for production — not the image's own CMD. The first install
+        # failed on exactly that difference (the chart's args replaced the
+        # image's command and "--transport" was run as the executable), and the
+        # image's CMD had passed every test.
+        run: |
+          read -r -a CMD <<< "$(helm template seldon-mcp deploy/helm/seldon-mcp -f deploy/helm/seldon-mcp/values-neuralk.yaml \
+            | python3 -c '
+          import sys, yaml
+          for doc in yaml.safe_load_all(sys.stdin):
+              if doc and doc.get("kind") == "Deployment":
+                  c = doc["spec"]["template"]["spec"]["containers"][0]
+                  print(" ".join(c.get("command", []) + c.get("args", [])))
+          ')"
+          echo "chart command: ${CMD[*]}"
+          # Kubernetes semantics, exactly: `command` replaces the ENTRYPOINT and
+          # `args` replace the CMD. Passing the whole line as the docker
+          # command would append it to the image's own entrypoint.
+          # --read-only and a tmpfs /tmp mirror the chart's securityContext: the
+          # root filesystem is read-only in production and /tmp is the one
+          # writable mount. A library writing anywhere else fails here, not there.
+          docker run -d --name mcp -p 8000:8000 --read-only --tmpfs /tmp --user 10001:10001 \
+            -e REQUIRE_CLIENT_API_KEY=true --entrypoint "${CMD[0]}" seldon-mcp:ci "${CMD[@]:1}"
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz && break
+            sleep 1
+          done
+          if ! curl -fsS http://127.0.0.1:8000/healthz; then
+            echo "the container never answered /healthz; its log:"; docker logs mcp; exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
+          test "$code" = "401" || { echo "expected 401 without a key, got $code"; docker logs mcp; exit 1; }
+          docker rm -f mcp
+
+  helm:
+    # The chart renders with the production values, and lints clean.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint deploy/helm/seldon-mcp -f deploy/helm/seldon-mcp/values-neuralk.yaml
+
+      - name: helm template (production values)
+        run: helm template seldon-mcp deploy/helm/seldon-mcp -n seldon-mcp -f deploy/helm/seldon-mcp/values-neuralk.yaml > /dev/null
+
+      - name: The chart refuses a credential in values
+        run: |
+          if helm template seldon-mcp deploy/helm/seldon-mcp --set config.NEURALK_API_KEY=x > /dev/null 2>&1; then
+            echo "chart rendered with a credential under config"; exit 1
+          fi
+          if helm template seldon-mcp deploy/helm/seldon-mcp --set replicaCount=2 > /dev/null 2>&1; then
+            echo "chart rendered two replicas with pod-local downloads"; exit 1
+          fi
+

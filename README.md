@@ -1,71 +1,67 @@
 # Seldon MCP Server
 
-An [MCP](https://modelcontextprotocol.io) server that gives LLMs access to [Seldon](https://www.neuralk-ai.com) — Neuralk's tabular foundation model for classification and regression.
+An [MCP](https://modelcontextprotocol.io) server that gives AI assistants access
+to [Seldon](https://www.neuralk-ai.com), Neuralk's tabular foundation model for
+classification and regression.
 
-Seldon uses in-context learning: you provide labeled examples as context and it predicts on new data, with zero hyperparameter tuning. This server wraps the [neuralk](https://pypi.org/project/neuralk/) Python SDK so any MCP client (Claude Desktop, Claude Code, etc.) can run tabular ML workflows through natural language.
+Seldon uses in-context learning: you provide labeled examples as context and it
+predicts on new data, with zero hyperparameter tuning. This server is a thin
+proxy in front of Neuralk's prediction API. It never reads files from disk: data
+reaches Seldon either inline in a tool call (small datasets) or through an
+upload straight to Neuralk (any size), and the server only holds the reference.
 
-## Quick start
+## Use the hosted server
 
-### Prerequisites
+Neuralk runs this server at **`https://mcp.neuralk.ai/mcp`** (Streamable HTTP).
+Nothing to install: point your MCP client at it and send your own Neuralk API
+key on every request, as either header:
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/)
-- A Neuralk API key — sign up at [neuralk-ai.com](https://www.neuralk-ai.com) or run `neuralk login`
+| Header | Value |
+|---|---|
+| `x-neuralk-api-key` | `nk_live_...` |
+| `Authorization` | `Bearer nk_live_...` |
 
-### Install and run
+You are billed on your own account. Create a key at
+[prediction.neuralk-ai.com/dashboard/api-keys](https://prediction.neuralk-ai.com/dashboard/api-keys)
+or run `neuralk login`.
 
-Run the server directly from GitHub with [uv](https://docs.astral.sh/uv/) — no clone required:
+### Claude Code
 
 ```bash
-export NEURALK_API_KEY=nk_live_...
-uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp
+claude mcp add --transport http seldon https://mcp.neuralk.ai/mcp \
+  --header "x-neuralk-api-key: nk_live_..."
 ```
 
-For local development, clone the repo instead:
-
-```bash
-git clone https://github.com/Neuralk-AI/mcp-server.git
-cd mcp-server
-uv sync
-uv run seldon-mcp
-```
-
-## Configuration
-
-Set via environment variables or a `.env` file in the project directory:
-
-| Variable | Default | Description |
-|---|---|---|
-| `NEURALK_API_KEY` | `None` | Server-level API key (optional if clients provide their own via header) |
-| `NEURALK_API_BASE_URL` | `https://api.prediction.neuralk-ai.com` | Base URL of the Neuralk SaaS auth API used to validate keys |
-| `NEURALK_HOST` | `None` (cloud) | On-premise server URL for the inference SDK |
-| `SELDON_DEFAULT_MODEL` | `seldon-small` | Default model variant |
-| `SELDON_DATA_DIR` | `.` | Base directory for resolving relative file paths |
-| `SKIP_API_KEY_VALIDATION` | `false` | Disable upfront key validation (not recommended) |
-| `API_KEY_VALIDATION_TTL_S` | `300` | Cache TTL for successful whoami responses |
-| `API_KEY_VALIDATION_TIMEOUT_S` | `5.0` | HTTP timeout for the whoami request |
-
-### API key validation
-
-Before any `predict` or `evaluate` call, the resolved API key is validated
-against `GET {NEURALK_API_BASE_URL}/api/v1/auth/whoami`. This catches
-revoked / invalid / expired keys with a clear MCP error rather than letting
-the SDK fail mid-inference. Successful responses are cached in-process for
-`API_KEY_VALIDATION_TTL_S` seconds. If the auth API is unreachable, the
-validation step is skipped (fail-open) and the SDK call surfaces the error.
-
-## Connect to an MCP client
-
-### Claude Desktop
-
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+### Cursor, Windsurf, VS Code and other clients with a JSON config
 
 ```json
 {
   "mcpServers": {
     "seldon": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/Neuralk-AI/mcp-server", "seldon-mcp"],
+      "url": "https://mcp.neuralk.ai/mcp",
+      "headers": {
+        "x-neuralk-api-key": "nk_live_..."
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Claude Desktop reaches remote servers through a local bridge. Add to
+`claude_desktop_config.json` (`~/Library/Application Support/Claude/` on
+macOS, `%APPDATA%\Claude\` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "seldon": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "https://mcp.neuralk.ai/mcp",
+        "--header", "x-neuralk-api-key:${NEURALK_API_KEY}"
+      ],
       "env": {
         "NEURALK_API_KEY": "nk_live_..."
       }
@@ -74,131 +70,105 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
-### Claude Code
-
-```bash
-claude mcp add seldon -- uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp
-```
-
-### Remote (SSE)
-
-```bash
-NEURALK_API_KEY=nk_live_... uv run seldon-mcp --transport sse --port 8000
-```
-
-Clients connect with their own API key via the `x-neuralk-api-key` header:
-
-```json
-{
-  "mcpServers": {
-    "seldon": {
-      "url": "http://your-server:8000/sse",
-      "headers": {
-        "x-neuralk-api-key": "nk_live_users_own_key"
-      }
-    }
-  }
-}
-```
-
-**API key resolution order:**
-1. `x-neuralk-api-key` HTTP header (per-user)
-2. `NEURALK_API_KEY` env var on the server (shared fallback)
-
-If neither is set, predict/evaluate calls return an error. The `describe_data` and `list_models` tools work without a key.
+A request without a key is answered `401`; a rejected or revoked key is
+reported by the tool call with the reason.
 
 ## Tools
 
-### `describe_data`
-
-Load a tabular file and get a statistical summary — shape, column types, null counts, numeric stats, and sample rows.
-
-```
-describe_data(file_path="housing.csv")
-```
-
-### `predict`
-
-Make predictions with Seldon. Provide a context file with labeled examples and either a separate predict file or use an automatic holdout split.
-
-```
-predict(
-    context_file="train.csv",
-    target_column="price",
-    predict_file="new_data.csv",
-    model="seldon-large"
-)
-```
-
-| Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `context_file` | str | yes | | Path to labeled data (context examples) |
-| `target_column` | str | yes | | Name of the target column |
-| `predict_file` | str | no | `None` | Data to predict on. If omitted, holds out from context_file |
-| `feature_columns` | list[str] | no | all except target | Columns to use as features |
-| `model` | str | no | server default | `seldon-flash`, `seldon-small`, or `seldon-large` |
-| `holdout_size` | float | no | `0.2` | Holdout fraction (when predict_file is omitted) |
-| `random_state` | int | no | `42` | Random seed for the split |
-
-### `evaluate`
-
-Make predictions and compute performance metrics against ground truth.
-
-```
-evaluate(
-    context_file="data.csv",
-    target_column="species",
-    model="seldon-small"
-)
-```
-
-Returns:
-- **Classification**: accuracy, F1 (weighted), precision, recall, confusion matrix
-- **Regression**: MAE, MSE, RMSE, R², median absolute error
-
-Parameters are the same as `predict`, with `test_file` in place of `predict_file`.
-
-### `list_models`
-
-Returns the available Seldon model variants:
-
-| Model | Description |
+| Tool | What it does |
 |---|---|
-| `seldon-flash` | Optimized for low latency |
-| `seldon-small` | Balanced speed and accuracy (default) |
-| `seldon-large` | Maximum accuracy for complex tasks |
+| `predict(dataset_key, label_classes?, max_predictions?)` | Run inference on a dataset already uploaded to Neuralk. The recommended path: no data passes through the server. |
+| `predict_from_data(data, target_column, ...)` | Predict from CSV text passed inline. Small datasets only (thousands of rows): the data travels through the tool call. |
+| `upload_data(data, target_column, ..., ttl_days?)` | Upload inline CSV once and get a `dataset_id` to predict on many times (e.g. to compare models). |
+| `create_upload(num_parts?)` | Start a presigned upload: returns URL(s) to `PUT` a real file to, directly to Neuralk's storage, without the key and without the data passing through the server. The answer is self-describing (archive spec + a ready-to-run recipe). |
+| `complete_upload(upload_id, dataset_key, parts)` | Finalize a presigned upload; the `dataset_key` then goes to `predict`. |
+| `list_models()` | The three Seldon variants: `seldon-flash` (speed), `seldon-small` (balanced, default), `seldon-large` (accuracy). |
 
-## Resources
+Prediction sets larger than `max_predictions` (default 5000) are truncated
+inline and the full CSV is offered as a single-use download link, valid five
+minutes.
 
-| URI | Description |
-|---|---|
-| `seldon://models` | Available model variants |
-| `seldon://config` | Current server configuration (API key masked) |
+The `drop_and_predict` prompt walks an assistant through the presigned flow for
+a dropped file. Resources: `seldon://models`, `seldon://config`.
 
-## Prompts
+**Context selection matters.** Seldon learns from the examples you give it, like
+few-shot prompting. Relevant context beats a large one: when predicting for one
+customer segment, give examples from that segment, not the whole table.
 
-Pre-built workflow templates for common tasks:
+## Run it yourself
 
-| Prompt | Description |
-|---|---|
-| `classify(file_path, target_column)` | Guided classification: describe, predict, evaluate |
-| `regress(file_path, target_column)` | Guided regression: describe, predict, evaluate |
-| `compare_models(file_path, target_column)` | Evaluate all 3 model variants side by side |
+### Locally, over stdio
 
-## Supported file formats
+The classic way: one process per client, the key in the environment.
 
-- CSV (`.csv`)
-- Excel (`.xlsx`, `.xls`)
-- Parquet (`.parquet`)
-- JSON (`.json`) — tabular format (array of objects)
+```bash
+export NEURALK_API_KEY=nk_live_...
+uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp
+```
+
+Claude Code: `claude mcp add seldon --env NEURALK_API_KEY=nk_live_... -- uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp`
+
+### As a service, over HTTP
+
+The container serves the Streamable HTTP endpoint at `/mcp` (and `/`), a probe
+at `/healthz`, and the download links at `/downloads/<token>`.
+
+```bash
+docker build -t seldon-mcp .
+docker run --rm -p 8000:8000 -e REQUIRE_CLIENT_API_KEY=true seldon-mcp
+```
+
+Every request must then carry the client's key (the hosted mode above). To run
+a private instance that bills one organisation instead, set
+`NEURALK_API_KEY` and leave `REQUIRE_CLIENT_API_KEY` unset: the server's key is
+the fallback for requests that carry none.
+
+`seldon-mcp --transport streamable-http --host 0.0.0.0` runs the same thing
+without Docker. Defaults are the hosted ones: stateless (any replica answers any
+request), JSON answers (`--sse-response` for event streams),
+`--forwarded-allow-ips` for the proxies whose `X-Forwarded-*` headers to trust.
+
+### On Kubernetes
+
+[`deploy/helm/seldon-mcp`](deploy/helm/seldon-mcp) is the chart, and
+[`deploy/README.md`](deploy/README.md) the runbook of the Neuralk deployment
+(registry, DNS, certificate, verification).
+
+## Configuration
+
+Environment variables, or a `.env` file next to the process:
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEURALK_API_KEY` | unset | Server-level key, the fallback when a request carries none. Unset in hosted mode. |
+| `REQUIRE_CLIENT_API_KEY` | `false` | Hosted mode: refuse MCP requests without a client key (`401`); never use the server's key on a client's behalf. |
+| `SELDON_PUBLIC_URL` | unset | Public base URL the download links are built from (`https://mcp.neuralk.ai`). Empty = each request's own URL. |
+| `NEURALK_PREDICTION_URL` | `https://api.prediction.neuralk-ai.com` | The prediction API, which also validates keys (`/api/v1/auth/whoami`). |
+| `SELDON_DEFAULT_MODEL` | `seldon-small` | Model when a tool call names none. |
+| `SELDON_UPLOAD_TTL_DAYS` | unset (Neuralk default, 90) | Retention of datasets uploaded by `upload_data`: 1, 7, 30 or 90. |
+| `SELDON_DOWNLOAD_DIR` | system temp | Where the single-use prediction files are written. |
+| `SELDON_DOWNLOAD_TTL_SECONDS` | `300` | How long they live. |
+| `SKIP_API_KEY_VALIDATION` | `false` | Skip the upfront key check (not recommended). |
+| `API_KEY_VALIDATION_TTL_S` | `300` | Cache of successful key checks. |
+| `API_KEY_VALIDATION_TIMEOUT_S` | `5.0` | Timeout of the key check. |
+
+Keys are validated against the auth API before a tool runs; a `401`/`403` comes
+back as a clear tool error rather than a traceback mid-inference. If the auth
+API is unreachable the check is skipped and the prediction call reports the
+real error itself. Keys never appear in logs or error messages.
 
 ## Development
 
 ```bash
 uv sync
-uv run ruff check src/
+uv run ruff check src/ tests/
 uv run pytest
 ```
+
+Tests never reach the network (`pytest-socket`); every outbound call is mocked
+at the HTTP boundary. CI also builds the container, boots it and checks that an
+MCP request without a key is refused, and lints and renders the Helm chart with
+the production values.
 
 ## License
 

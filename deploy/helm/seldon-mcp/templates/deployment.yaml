@@ -1,0 +1,165 @@
+{{/*
+Render-time guards. They `fail` instead of producing something subtly wrong,
+because a values file is where each of these mistakes gets made and rendering is
+where it is cheapest to catch.
+*/}}
+{{/*
+A credential named under `config` is rendered as an `env` entry, and an `env`
+entry wins over `envFrom`. A key committed in values.yaml would then quietly be
+the key the server really uses — and it would be in git. Credentials arrive one
+way only: the Secret named by existingSecret.
+*/}}
+{{- range $key := list "NEURALK_API_KEY" }}
+{{- if hasKey $.Values.config $key }}
+{{- fail (printf "config.%s is a credential: put it in the Secret named by existingSecret, never in values — an env entry overrides the Secret, and it would be in git." $key) }}
+{{- end }}
+{{- end }}
+{{/*
+Download files are written by the pod that answered the tool call and fetched by
+whichever pod the load balancer picks next. With an emptyDir those are two
+different disks half the time, and the link 404s. More than one replica needs a
+volume every pod sees.
+*/}}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.downloads.existingClaim) }}
+{{- fail (printf "replicaCount is %d but downloads.existingClaim is empty: a download link served by one pod would 404 on another. Name a ReadWriteMany claim in downloads.existingClaim, or keep one replica." (int .Values.replicaCount)) }}
+{{- end }}
+{{- if and .Values.ingress.enabled (not .Values.ingress.host) }}
+{{- fail "ingress.enabled is true but ingress.host is empty: there is no name to serve the server on." }}
+{{- end }}
+{{- $publicUrl := include "seldon-mcp.publicUrl" . }}
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled $publicUrl (not (hasPrefix "https://" $publicUrl)) }}
+{{- fail (printf "ingress.tls.enabled is true but the public URL is %q, which is not https://. Download links would point at a plain-HTTP address the ingress redirects away from." $publicUrl) }}
+{{- end }}
+{{- if and .Values.ingress.enabled .Values.ingress.host .Values.config.SELDON_PUBLIC_URL (not (contains .Values.ingress.host .Values.config.SELDON_PUBLIC_URL)) }}
+{{- fail (printf "config.SELDON_PUBLIC_URL (%s) does not name ingress.host (%s): download links would point at a host this release does not serve. Leave SELDON_PUBLIC_URL empty to derive it from the ingress." .Values.config.SELDON_PUBLIC_URL .Values.ingress.host) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "seldon-mcp.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "seldon-mcp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # The new pod is Ready before the old one goes: no gap in service. The
+      # few seconds of overlap are harmless to the download links — a file
+      # saved by the old pod is fetched from it while it drains.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "seldon-mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "seldon-mcp.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pods when the configuration changes.
+        checksum/config: {{ toYaml .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "seldon-mcp.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # `command` is set explicitly: Kubernetes `args` alone replaces the
+          # image's CMD, and the first install ran "--transport" as the
+          # executable ("file not found", 2026-09-03). Naming the binary here
+          # makes the chart independent of how the image declares it.
+          command:
+            - seldon-mcp
+          args:
+            - --transport
+            - streamable-http
+            - --host
+            - "0.0.0.0"
+            - --port
+            - {{ .Values.service.targetPort | quote }}
+            - {{ ternary "--stateless" "--stateful" .Values.server.stateless }}
+            - {{ ternary "--json-response" "--sse-response" .Values.server.jsonResponse }}
+            - --forwarded-allow-ips
+            - {{ .Values.server.forwardedAllowIps | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            {{- range $key, $value := .Values.config }}
+            {{- if and (eq $key "SELDON_PUBLIC_URL") (not $value) }}
+            {{- /* derived below */}}
+            {{- else }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if and (not .Values.config.SELDON_PUBLIC_URL) $publicUrl }}
+            - name: SELDON_PUBLIC_URL
+              value: {{ $publicUrl | quote }}
+            {{- end }}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # The root filesystem is read-only; this is the one writable place,
+            # where the download files and Python's temp files go.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          {{- if .Values.downloads.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.downloads.existingClaim }}
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.downloads.sizeLimit }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

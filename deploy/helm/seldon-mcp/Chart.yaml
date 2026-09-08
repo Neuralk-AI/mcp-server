@@ -1,0 +1,14 @@
+apiVersion: v2
+name: seldon-mcp
+description: Seldon MCP server — Neuralk's tabular foundation model, served to MCP clients over HTTP.
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
+home: https://github.com/Neuralk-AI/mcp-server
+keywords:
+  - mcp
+  - seldon
+  - neuralk
+maintainers:
+  - name: Neuralk AI
+    email: info@neuralk-ai.com

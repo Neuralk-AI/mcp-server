@@ -1,21 +1,37 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import sys
+import tempfile
+import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import anyio
 import click
 from mcp.server.fastmcp import Context, FastMCP
-from neuralk import NeuralkException, Seldon, SeldonClassifier, SeldonRegressor
-from sklearn.model_selection import train_test_split
+from mcp.server.transport_security import TransportSecuritySettings
+from neuralk.exceptions import NeuralkException, NeuralkTermsNotAcceptedError
+from starlette.datastructures import Headers
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+from seldon_mcp import dataset, neuralk_sdk
 from seldon_mcp.auth import APIKeyAuthError, _SkipValidation, validate_api_key
 from seldon_mcp.config import SeldonConfig
-from seldon_mcp.data_loader import describe_dataframe, load_dataframe
-from seldon_mcp.metrics import compute_classification_metrics, compute_regression_metrics
+from seldon_mcp.downloads import DownloadStore
+from seldon_mcp.prediction_client import (
+    PredictionAPIError,
+    multipart_complete,
+    multipart_init,
+    multipart_sign,
+)
 
 logger = logging.getLogger("seldon_mcp")
 
@@ -29,6 +45,7 @@ def _sanitize_error(e: Exception, config: SeldonConfig, request_api_key: str | N
         msg = msg.replace(request_api_key, "***")
     return msg
 
+
 SELDON_MODELS = [
     {"name": "seldon-flash", "description": "Optimized for low latency", "tier": "speed"},
     {"name": "seldon-small", "description": "Balanced speed and accuracy (default)", "tier": "balanced"},
@@ -36,6 +53,36 @@ SELDON_MODELS = [
 ]
 
 VALID_MODEL_NAMES = {m["name"] for m in SELDON_MODELS}
+VALID_TASK_TYPES = {"classification", "regression"}
+
+
+# Self-describing archive spec returned by create_upload, so a client can build
+# the upload WITHOUT reading this server's source.
+_UPLOAD_ARCHIVE_SPEC = {
+    "container": "a tar archive compressed with zstd (level 6)",
+    "files": {
+        "metadata.json": {
+            "method": "fit_predict",
+            "model": "one of seldon-small | seldon-flash | seldon-large",
+            "dataset": "<any name>",
+            "prompter_config": None,
+            "problem_type": "classification | regression",
+            "memory_optimization": "true for regression, false for classification",
+            "preprocess": True,
+            "metadata": {},
+            "user": "",
+            "version": 1,
+        },
+        "X_train.npy": "numpy .npy, float32, shape (n_train, n_features)",
+        "y_train.npy": "numpy .npy; int64 for classification (label-encode string labels first, "
+                       "keep the mapping to decode predictions), float64 for regression",
+        "X_test.npy": "numpy .npy, float32, shape (n_test, n_features); the rows to predict on",
+    },
+    "notes": "Arrays are loaded with allow_pickle=False, so they must be numeric. "
+             "Categorical feature columns must be encoded to numbers (e.g. one-hot) before saving. "
+             "This layout mirrors the neuralk SDK 1.2.x archive format; if the SDK's format "
+             "changes, this spec and the drop_and_predict recipe must be updated to match.",
+}
 
 
 def _validate_params(
@@ -65,39 +112,107 @@ def _validate_params(
 
 
 _lifespan_config: SeldonConfig | None = None
+_download_store: DownloadStore | None = None
+_server_key_checked = False
+
+
+def _init_state(config: SeldonConfig | None = None) -> SeldonConfig:
+    """Create the process-wide configuration and download store, once.
+
+    The CLI calls this before serving; the first session's lifespan calls it as
+    a fallback (tests and embedders that never go through the CLI). It is
+    idempotent: a second call returns what the first one built.
+
+    Nothing built here is ever torn down while the process serves. Over HTTP
+    the MCP lifespan runs once per client session — once per request in
+    stateless mode — so a teardown at the end of one session would pull the
+    download store from under every other session still answering.
+
+    Args:
+        config: Configuration to install. Defaults to reading the environment.
+
+    Returns:
+        The process-wide configuration.
+    """
+    global _lifespan_config, _download_store
+    if _lifespan_config is None:
+        _lifespan_config = config or SeldonConfig()
+    if _download_store is None:
+        cfg = _lifespan_config
+        download_dir = cfg.seldon_download_dir or str(Path(tempfile.gettempdir()) / "seldon-mcp-downloads")
+        _download_store = DownloadStore(download_dir, ttl_seconds=cfg.seldon_download_ttl_seconds)
+        _download_store.sweep()  # clear anything left over from a previous run
+        logger.info("Download store: %s (files live %ss)", download_dir, cfg.seldon_download_ttl_seconds)
+    return _lifespan_config
+
+
+def _start_download_sweeper(store: DownloadStore, interval: int = 60) -> threading.Thread:
+    """Start the daemon thread that deletes expired download files.
+
+    A belt to the serve-time braces: files are also deleted when served and
+    swept on every save, so the thread only reclaims files nobody fetched.
+
+    Args:
+        store: The download store to sweep.
+        interval: Seconds between sweeps.
+
+    Returns:
+        The started thread.
+    """
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                store.sweep()
+            except Exception:  # noqa: BLE001 - a sweep must never kill the thread
+                logger.exception("download sweep failed")
+
+    thread = threading.Thread(target=_loop, name="seldon-mcp-download-sweeper", daemon=True)
+    thread.start()
+    return thread
+
+
+async def _check_server_key_once(config: SeldonConfig) -> None:
+    """Pre-validate the server-level key, once per process, log only.
+
+    Per-request keys are validated on the tool call that uses them.
+    """
+    global _server_key_checked
+    if _server_key_checked or not config.neuralk_api_key or config.skip_api_key_validation:
+        return
+    _server_key_checked = True
+    try:
+        result = await validate_api_key(
+            config.neuralk_api_key,
+            base_url=config.neuralk_prediction_url,
+            ttl_s=config.api_key_validation_ttl_s,
+            timeout_s=config.api_key_validation_timeout_s,
+        )
+        logger.info(
+            "Server-level Neuralk API key validated (org=%s, key=%s, scopes=%s)",
+            result.organization_id, result.key_name, ",".join(result.scopes),
+        )
+    except APIKeyAuthError as exc:
+        logger.error("Server-level NEURALK_API_KEY rejected by auth API: %s", exc)
+    except _SkipValidation:
+        logger.warning(
+            "Could not pre-validate server-level NEURALK_API_KEY (auth API unreachable); "
+            "validation will be retried on first tool call."
+        )
 
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
-    """Initialize configuration at server startup."""
-    global _lifespan_config
-    config = SeldonConfig()
-    _lifespan_config = config
-    logger.info("Seldon MCP server started")
-    if config.neuralk_api_key and not config.skip_api_key_validation:
-        try:
-            result = await validate_api_key(
-                config.neuralk_api_key,
-                base_url=config.neuralk_api_base_url,
-                ttl_s=config.api_key_validation_ttl_s,
-                timeout_s=config.api_key_validation_timeout_s,
-            )
-            logger.info(
-                "Server-level Neuralk API key validated (org=%s, key=%s, scopes=%s)",
-                result.organization_id, result.key_name, ",".join(result.scopes),
-            )
-        except APIKeyAuthError as exc:
-            logger.error("Server-level NEURALK_API_KEY rejected by auth API: %s", exc)
-        except _SkipValidation:
-            logger.warning(
-                "Could not pre-validate server-level NEURALK_API_KEY (auth API unreachable); "
-                "validation will be retried on first tool call."
-            )
-    try:
-        yield {"config": config}
-    finally:
-        _lifespan_config = None
-        logger.info("Seldon MCP server shutting down")
+    """Hand each MCP session the process-wide configuration.
+
+    Runs once per session: once per process over stdio, once per client
+    session over HTTP, once per request in stateless HTTP mode. State is built
+    by ``_init_state`` (idempotent) and deliberately not torn down here.
+    """
+    config = _init_state()
+    await _check_server_key_once(config)
+    yield {"config": config}
 
 
 mcp = FastMCP(
@@ -105,65 +220,99 @@ mcp = FastMCP(
     instructions="""Seldon is Neuralk's tabular foundation model. It uses in-context learning — \
 you provide labeled examples as context and it predicts on new data, with zero hyperparameter tuning.
 
-IMPORTANT — context selection:
-Seldon is NOT a traditional model where more data is always better. It learns from the context \
-examples you provide, similar to few-shot prompting. The context should be RELEVANT to what you're \
-predicting. For example, if predicting churn rate for a specific customer category, provide context \
-examples from that category or very similar ones — don't just dump the entire dataset. \
-Irrelevant context examples add noise and hurt performance. When helping users, think about what \
-subset of their data is most representative of the prediction target and guide them to filter or \
-select context accordingly.
+This server is a thin proxy to Neuralk's prediction API. It never reads your data files from disk — \
+it works purely with datasets already uploaded to Neuralk (referenced by a dataset_id) or with data \
+passed inline to a tool call. (Predictions too large to return inline are cached briefly on disk and \
+served once via a single-use download link.)
 
-Typical workflow:
-1. Use describe_data to inspect the dataset (shape, columns, types, nulls).
-2. Think about which rows are most relevant as context for the prediction task. Help the user \
-filter or select appropriate context data if needed.
-3. Use predict or evaluate with the context file and target column.
-4. If auto-detection picks the wrong task type, set task_type="classification" or "regression" explicitly.
+Two ways to predict:
+1. predict(dataset_key=...) — the recommended path. The dataset has already been uploaded directly to \
+Neuralk (returning a dataset_id) by a client/code-execution step or by upload_data. The data never \
+passes through this server or the conversation.
+2. predict_from_data(data=..., target_column=...) — convenience path for SMALL datasets only. Pass the \
+CSV content inline as a string; the server builds the upload archive and predicts in one call. The \
+data travels through the tool call, so keep it small (thousands of rows at most). For anything larger, \
+upload directly to Neuralk and use predict(dataset_key=...).
+
+IMPORTANT — context selection:
+Seldon learns from the context examples you provide, similar to few-shot prompting. The context should \
+be RELEVANT to what you're predicting — don't just dump an entire dataset. Irrelevant context adds \
+noise and hurts performance.
 
 Key things to know:
-- context_file is the labeled data Seldon learns from. Quality and relevance of context matters \
-more than quantity.
-- If you omit predict_file/test_file, a holdout split is used automatically.
-- File paths are relative to the server's data directory. Ask the user for the file path if not provided.
-- Three model variants exist: seldon-flash (fast), seldon-small (balanced, default), seldon-large (most accurate).
-- For classification, evaluate returns accuracy, F1, precision, recall, and a confusion matrix.
-- For regression, evaluate returns MAE, RMSE, R2, and median absolute error.
-- Always describe the data first so you can identify the correct target column and understand the features.""",
+- For classification with string labels, predictions are returned in the original label space.
+- Three model variants exist: seldon-flash (fast), seldon-small (balanced, default), seldon-large \
+(most accurate).
+- If auto-detection picks the wrong task type, set task_type="classification" or "regression".""",
     lifespan=app_lifespan,
-    dependencies=["neuralk", "polars", "scikit-learn"],
+    dependencies=["polars", "scikit-learn", "skrub", "httpx", "zstandard", "numpy"],
 )
 
 
 API_KEY_HEADER = "x-neuralk-api-key"
+AUTHORIZATION_HEADER = "authorization"
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def _get_config(ctx: Context) -> SeldonConfig:
     return ctx.request_context.lifespan_context["config"]
 
 
+def _api_key_from_headers(headers: Any) -> str | None:
+    """Read the client's Neuralk API key from HTTP headers.
+
+    Two spellings are accepted: the ``x-neuralk-api-key`` header, and the
+    MCP-conventional ``Authorization: Bearer <key>``, so any client that can
+    send one static header can connect.
+
+    Args:
+        headers: A mapping with ``get`` (Starlette headers or a plain dict).
+
+    Returns:
+        The key, or None when neither header carries one.
+    """
+    key = headers.get(API_KEY_HEADER)
+    if key and key.strip():
+        return key.strip()
+    auth = headers.get(AUTHORIZATION_HEADER) or headers.get("Authorization") or ""
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return None
+
+
 def _get_request_api_key(ctx: Context) -> str | None:
     """Extract the per-request API key from HTTP headers, if present."""
     request = ctx.request_context.request
     if request is not None:
-        return request.headers.get(API_KEY_HEADER)
+        return _api_key_from_headers(request.headers)
     return None
 
 
 def _resolve_api_key(ctx: Context, config: SeldonConfig) -> str:
-    """Resolve the Neuralk API key: per-request header > server env var."""
+    """Resolve the Neuralk API key: per-request header > server env var.
+
+    With ``require_client_api_key`` set (the hosted deployment), the server's
+    own key is never used on a client's behalf: a request without a key is an
+    error that names the headers to send.
+    """
     header_key = _get_request_api_key(ctx)
     if header_key:
         return header_key
 
+    if config.require_client_api_key:
+        raise ValueError(
+            "This server needs your own Neuralk API key on every request: send it as the "
+            f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. Create a key at "
+            "https://prediction.neuralk-ai.com/dashboard/api-keys."
+        )
     if config.neuralk_api_key:
         return config.neuralk_api_key
-
     raise ValueError(
         "No Neuralk API key provided. Either set NEURALK_API_KEY on the server "
-        f"or pass it via the '{API_KEY_HEADER}' HTTP header."
+        f"or pass it via the '{API_KEY_HEADER}' HTTP header (or 'Authorization: Bearer <key>')."
     )
-
 
 async def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
     """Resolve and validate the Neuralk API key against the saas auth API.
@@ -181,7 +330,7 @@ async def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
     try:
         await validate_api_key(
             api_key,
-            base_url=config.neuralk_api_base_url,
+            base_url=config.neuralk_prediction_url,
             ttl_s=config.api_key_validation_ttl_s,
             timeout_s=config.api_key_validation_timeout_s,
         )
@@ -194,271 +343,451 @@ async def _get_api_key(ctx: Context, config: SeldonConfig) -> str:
     return api_key
 
 
-VALID_TASK_TYPES = {"classification", "regression"}
+def _sdk_error(e: NeuralkException, config: SeldonConfig, req_key: str | None) -> str:
+    """Format a NeuralkException from the SDK into a sanitized JSON error string.
 
-
-async def _make_seldon(
-    ctx: Context, config: SeldonConfig, model: str | None = None, task_type: str | None = None,
-) -> Seldon | SeldonClassifier | SeldonRegressor:
-    """Create a Seldon instance with the resolved API key.
-
-    If task_type is specified, returns the corresponding estimator directly.
-    Otherwise returns the auto-detecting Seldon convenience class.
+    Terms-of-service rejections get a targeted message pointing at the terms URL,
+    since the fix (an org accepting the ToS) is out of this server's hands.
     """
+    if isinstance(e, NeuralkTermsNotAcceptedError):
+        detail = (
+            "Neuralk Terms of Service not accepted for this organization. "
+            f"Accept version {e.terms_version or '(current)'} at {e.terms_url or 'the Neuralk console'} "
+            "before uploading or predicting."
+        )
+        return json.dumps({"error": detail, "terms_version": e.terms_version, "terms_url": e.terms_url})
+    msg = _sanitize_error(e, config, req_key)
+    return json.dumps({"error": f"Prediction API error ({getattr(e, 'status_code', '?')}): {msg}"})
+
+
+def _presigned_error(e: PredictionAPIError, config: SeldonConfig, req_key: str | None) -> str:
+    """Format a presigned-flow PredictionAPIError as sanitized JSON.
+
+    The raw multipart flow can't read the SDK's structured terms fields, but a 403
+    almost always means the org lacks permission or hasn't accepted the Terms of
+    Service — surface that hint so the client isn't left with a bare 403 (parity
+    with the friendlier terms message the SDK tools give).
+    """
+    msg = f"Prediction API error ({e.status_code}): {_sanitize_error(e, config, req_key)}"
+    if e.status_code == 403:
+        msg += (
+            " — this usually means the organization lacks permission or has not accepted "
+            "the Neuralk Terms of Service."
+        )
+    return json.dumps({"error": msg})
+
+
+async def _build_sdk_client(ctx: Context, config: SeldonConfig):
+    """Resolve+validate the API key and construct a neuralk SDK client for this request."""
     api_key = await _get_api_key(ctx, config)
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if config.neuralk_host:
-        kwargs["host"] = config.neuralk_host
-    if model:
-        kwargs["model"] = model
-    else:
-        kwargs["model"] = config.seldon_default_model
-
-    if task_type == "classification":
-        return SeldonClassifier(**kwargs)
-    elif task_type == "regression":
-        return SeldonRegressor(**kwargs)
-    return Seldon(**kwargs)
+    return neuralk_sdk.build_client(api_key, config.neuralk_prediction_url)
 
 
-def _get_task_type(seldon: Seldon) -> str:
-    """Get the task type from a fitted Seldon model."""
-    task = getattr(seldon, "task_type_", None)
-    if task:
-        return str(task)
-    # Fallback: check which estimator was dispatched
-    if hasattr(seldon, "classes_"):
-        return "classification"
-    return "regression"
+# --- Inline-data helpers (no filesystem access) ---
 
 
-def _prepare_data(
-    df,
+# Predictions flow back through the (size-limited) MCP tool result, so cap how
+# many are returned inline. A few thousand numeric predictions fit comfortably;
+# callers can raise this, and for very large test sets should predict in chunks.
+DEFAULT_MAX_INLINE_PREDICTIONS = 5000
+
+
+def _truncate_predictions(
+    result: dict, predictions: list, probabilities: list | None, max_display: int
+) -> None:
+    """Attach predictions to a result dict, truncating large arrays inline."""
+    result["num_predictions"] = len(predictions)
+    result["predictions"] = predictions[:max_display]
+    if len(predictions) > max_display:
+        result["note"] = (
+            f"Showing first {max_display} of {len(predictions)} predictions. Pass a larger "
+            "max_predictions to return more; the MCP result is size-limited, so for very large "
+            "test sets predict on the data in chunks and concatenate the results client-side."
+        )
+    if probabilities is not None:
+        result["prediction_probabilities"] = probabilities[:max_display]
+
+
+def _predictions_csv(predictions: list, probabilities: list | None) -> bytes:
+    """Serialize the full prediction set to CSV bytes (prediction + prob_* columns)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    n_probs = len(probabilities[0]) if probabilities and probabilities[0] is not None else 0
+    writer.writerow(["prediction", *[f"prob_{i}" for i in range(n_probs)]])
+    for i, pred in enumerate(predictions):
+        row = [pred]
+        if probabilities and i < len(probabilities) and probabilities[i] is not None:
+            row.extend(probabilities[i])
+        writer.writerow(row)
+    return buf.getvalue().encode("utf-8")
+
+
+async def _attach_download(ctx: Context, result: dict, predictions: list, probabilities: list | None) -> None:
+    """Write the full predictions to the disk store and add a single-use download_url.
+
+    Only available over HTTP transports (served by the server's /downloads route).
+    No-op under stdio, where there is no HTTP endpoint to fetch from.
+    """
+    request = ctx.request_context.request
+    if request is None or not predictions or _download_store is None:
+        return
+    store = _download_store
+    token = await anyio.to_thread.run_sync(lambda: store.save(_predictions_csv(predictions, probabilities)))
+    # Behind an ingress the request's own base URL is the pod's view (plain
+    # http, whatever Host the proxy forwarded); SELDON_PUBLIC_URL is the address
+    # a client can actually fetch from.
+    base_url = _get_config(ctx).public_url or str(request.base_url)
+    result["download_url"] = f"{base_url.rstrip('/')}/downloads/{token}"
+    result["download_note"] = (
+        f"All {len(predictions)} predictions as CSV. Single-use link; expires in "
+        f"{store.ttl_seconds // 60} min or when downloaded."
+    )
+
+
+def _build_inline_arrays(
+    *,
+    data: str,
     target_column: str,
-    feature_columns: list[str] | None = None,
+    predict_data: str | None,
+    feature_columns: list[str] | None,
+    model: str | None,
+    task_type: str | None,
+    holdout_size: float,
+    random_state: int,
 ):
-    """Extract features and target from a polars DataFrame, returning pandas objects."""
-    pdf = df.to_pandas()
-    if target_column not in pdf.columns:
-        available = ", ".join(pdf.columns.tolist())
-        raise ValueError(f"Target column '{target_column}' not found. Available columns: {available}")
+    """Parse inline CSV text into numeric arrays for the upload archive.
 
-    if feature_columns:
-        missing = [c for c in feature_columns if c not in pdf.columns]
-        if missing:
-            raise ValueError(f"Feature columns not found: {', '.join(missing)}")
-        X = pdf[feature_columns]
-    else:
-        X = pdf.drop(columns=[target_column])
-
-    y = pdf[target_column].values
-    return X, y
+    Returns (X_train, y_train, X_test, label_classes, feature_names, problem_type).
+    Shared by the inline upload_data and predict_from_data tools. No filesystem access.
+    """
+    df = dataset.parse_csv(data)
+    _validate_params(
+        holdout_size, model, df.height,
+        has_separate_file=predict_data is not None, task_type=task_type,
+    )
+    predict_df = dataset.parse_csv(predict_data) if predict_data else None
+    return dataset.prepare_arrays(
+        df, target_column, predict_df=predict_df, feature_columns=feature_columns,
+        holdout_size=holdout_size, random_state=random_state, problem_type=task_type,
+    )
 
 
 # --- MCP Tools ---
 
 
 @mcp.tool()
-async def describe_data(ctx: Context, file_path: str, include_sample: bool = True) -> str:
-    """Load a tabular data file and return a statistical summary.
-
-    Describes the shape, column types, null counts, numeric statistics,
-    and optionally sample rows from a CSV, Excel, Parquet, or JSON file.
-
-    Args:
-        file_path: Path to the data file (CSV, Excel, Parquet, or JSON).
-        include_sample: Whether to include the first 5 rows as a sample. Defaults to True.
-    """
-    config = _get_config(ctx)
-    try:
-        df = await anyio.to_thread.run_sync(
-            lambda: load_dataframe(file_path, config.seldon_data_dir)
-        )
-        summary = describe_dataframe(df, include_sample=include_sample)
-        summary["file_path"] = file_path
-        return json.dumps(summary, default=str)
-    except (FileNotFoundError, ValueError) as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
 async def predict(
     ctx: Context,
-    context_file: str,
-    target_column: str,
-    predict_file: str | None = None,
-    feature_columns: list[str] | None = None,
-    model: str | None = None,
-    task_type: str | None = None,
-    holdout_size: float = 0.2,
-    random_state: int = 42,
+    dataset_key: str,
+    label_classes: list[str] | None = None,
+    max_predictions: int = DEFAULT_MAX_INLINE_PREDICTIONS,
 ) -> str:
-    """Make predictions using Seldon's tabular foundation model.
+    """Run inference on a dataset already uploaded to Neuralk's prediction API.
 
-    Provide a context file with labeled examples and optionally a separate file
-    to predict on. If no predict_file is given, a holdout split from the context
-    file is used.
+    This is the recommended path: the dataset is uploaded directly to Neuralk
+    (returning a dataset_id) by a client/code-execution step or by upload_data;
+    this server only references it. No data passes through the server here.
 
     Args:
-        context_file: Path to the labeled data file used as context examples.
-        target_column: Name of the target/label column.
-        predict_file: Path to unlabeled data to predict on. If omitted, holds out from context_file.
-        feature_columns: Columns to use as features. If omitted, uses all columns except target.
-        model: Seldon model variant (seldon-flash, seldon-small, seldon-large). Defaults to server config.
-        task_type: Force "classification" or "regression". If omitted, Seldon auto-detects from the target.
-        holdout_size: Fraction to hold out for prediction when predict_file is omitted. Defaults to 0.2.
-        random_state: Random seed for the holdout split. Defaults to 42.
+        dataset_key: The dataset_id returned by Neuralk's upload API (or upload_data).
+        label_classes: Optional ordered class labels used to decode integer-coded
+            predictions back to the original labels (returned by upload_data).
+        max_predictions: Max predictions to return inline (default 5000). The full
+            count is always reported as num_predictions; raise this to return more.
     """
     config = _get_config(ctx)
     req_key = _get_request_api_key(ctx)
 
     try:
-        context_df = await anyio.to_thread.run_sync(
-            lambda: load_dataframe(context_file, config.seldon_data_dir)
-        )
-        X_context, y_context = _prepare_data(context_df, target_column, feature_columns)
-        _validate_params(
-            holdout_size, model, len(X_context),
-            has_separate_file=predict_file is not None, task_type=task_type,
+        client = await _build_sdk_client(ctx, config)
+        response = await anyio.to_thread.run_sync(
+            lambda: neuralk_sdk.predict_by_reference(client, dataset_key)
         )
 
-        if predict_file:
-            predict_df = await anyio.to_thread.run_sync(
-                lambda: load_dataframe(predict_file, config.seldon_data_dir)
-            )
-            X_predict = predict_df.to_pandas()
-            if target_column in X_predict.columns:
-                X_predict = X_predict.drop(columns=[target_column])
-            if feature_columns:
-                X_predict = X_predict[feature_columns]
-        else:
-            X_context, X_predict, y_context, _ = train_test_split(
-                X_context, y_context, test_size=holdout_size, random_state=random_state,
-            )
+        predictions = dataset.decode_predictions(response["predictions"], label_classes)
+        probabilities = response.get("probabilities")
 
-        seldon = await _make_seldon(ctx, config, model, task_type=task_type)
-
-        def _fit_predict():
-            seldon.fit(X_context, y_context)
-            preds = seldon.predict(X_predict)
-            probas = None
-            resolved_task_type = task_type or _get_task_type(seldon)
-            if resolved_task_type == "classification" and hasattr(seldon, "predict_proba"):
-                try:
-                    probas = seldon.predict_proba(X_predict)
-                except NotImplementedError:
-                    pass
-            return preds, probas, resolved_task_type
-
-        predictions, probabilities, resolved_task_type = await anyio.to_thread.run_sync(_fit_predict)
-        max_display = 100
         result = {
-            "task_type": resolved_task_type,
-            "model": model or config.seldon_default_model,
-            "num_context_samples": len(X_context),
-            "num_predict_samples": len(X_predict),
-            "predictions": predictions[:max_display].tolist(),
-            "feature_columns": list(X_context.columns),
-            "target_column": target_column,
+            "source": "prediction_api",
+            "dataset_id": dataset_key,
+            "request_id": response.get("request_id"),
+            "model": response.get("model"),
+            "credits_consumed": response.get("credits_consumed"),
+            "latency_ms": response.get("latency_ms"),
         }
-
-        if len(predictions) > max_display:
-            result["note"] = f"Showing first {max_display} of {len(predictions)} predictions"
-
-        if probabilities is not None:
-            result["prediction_probabilities"] = probabilities[:max_display].tolist()
-
+        await _attach_download(ctx, result, predictions, probabilities)
+        _truncate_predictions(result, predictions, probabilities, max_predictions)
         return json.dumps(result, default=str)
 
-    except (FileNotFoundError, ValueError) as e:
-        return json.dumps({"error": str(e)})
+    except ValueError as e:
+        return json.dumps({"error": _sanitize_error(e, config, req_key)})
     except NeuralkException as e:
-        return json.dumps({"error": f"Neuralk API error: {_sanitize_error(e, config, req_key)}"})
+        return _sdk_error(e, config, req_key)
     except Exception as e:
         return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
 
 
 @mcp.tool()
-async def evaluate(
+async def predict_from_data(
     ctx: Context,
-    context_file: str,
+    data: str,
     target_column: str,
-    test_file: str | None = None,
+    predict_data: str | None = None,
     feature_columns: list[str] | None = None,
     model: str | None = None,
     task_type: str | None = None,
     holdout_size: float = 0.2,
     random_state: int = 42,
+    use_probabilities: bool = True,
+    dataset_name: str = "inline",
+    max_predictions: int = DEFAULT_MAX_INLINE_PREDICTIONS,
 ) -> str:
-    """Make predictions and compute performance metrics using Seldon.
+    """Predict from inline CSV data (SMALL datasets only).
 
-    Fits the model with context examples and evaluates predictions against
-    ground truth. Returns classification metrics (accuracy, F1, precision,
-    recall) or regression metrics (MAE, RMSE, R2) depending on the task.
+    Pass the labeled data as CSV text; the server encodes it into the upload
+    archive, uploads it to Neuralk, and returns predictions. The data travels
+    through this tool call, so keep it small — for larger data, upload directly
+    to Neuralk and use predict(dataset_key=...).
 
     Args:
-        context_file: Path to the labeled data file used as context examples.
+        data: Labeled context data as CSV text.
         target_column: Name of the target/label column.
-        test_file: Path to labeled test data. If omitted, holds out from context_file.
+        predict_data: CSV text of unlabeled rows to predict on. If omitted, holds out from data.
         feature_columns: Columns to use as features. If omitted, uses all columns except target.
         model: Seldon model variant (seldon-flash, seldon-small, seldon-large). Defaults to server config.
-        task_type: Force "classification" or "regression". If omitted, Seldon auto-detects from the target.
-        holdout_size: Fraction to hold out for evaluation when test_file is omitted. Defaults to 0.2.
+        task_type: Force "classification" or "regression". If omitted, inferred from the target.
+        holdout_size: Fraction to hold out for prediction when predict_data is omitted. Defaults to 0.2.
         random_state: Random seed for the holdout split. Defaults to 42.
+        use_probabilities: Include class probabilities in the response when available. Defaults to True.
+        dataset_name: Name recorded in the archive metadata. Defaults to "inline".
+        max_predictions: Max predictions to return inline (default 5000). num_predictions
+            always reports the full count; raise this (or predict in chunks) for larger sets.
     """
     config = _get_config(ctx)
     req_key = _get_request_api_key(ctx)
 
     try:
-        context_df = await anyio.to_thread.run_sync(
-            lambda: load_dataframe(context_file, config.seldon_data_dir)
+        client = await _build_sdk_client(ctx, config)
+
+        X_train, y_train, X_test, label_classes, feature_names, problem_type = _build_inline_arrays(
+            data=data, target_column=target_column, predict_data=predict_data,
+            feature_columns=feature_columns, model=model, task_type=task_type,
+            holdout_size=holdout_size, random_state=random_state,
         )
-        X_context, y_context = _prepare_data(context_df, target_column, feature_columns)
-        _validate_params(
-            holdout_size, model, len(X_context),
-            has_separate_file=test_file is not None, task_type=task_type,
+
+        resolved_model = model or config.seldon_default_model
+
+        response = await anyio.to_thread.run_sync(
+            lambda: neuralk_sdk.predict_inline(
+                client, X_train=X_train, y_train=y_train, X_test=X_test,
+                model=resolved_model, problem_type=problem_type, dataset_name=dataset_name,
+            )
         )
 
-        if test_file:
-            test_df = await anyio.to_thread.run_sync(
-                lambda: load_dataframe(test_file, config.seldon_data_dir)
-            )
-            X_test, y_test = _prepare_data(test_df, target_column, feature_columns)
-        else:
-            X_context, X_test, y_context, y_test = train_test_split(
-                X_context, y_context, test_size=holdout_size, random_state=random_state,
-            )
-
-        seldon = await _make_seldon(ctx, config, model, task_type=task_type)
-
-        def _fit_predict():
-            seldon.fit(X_context, y_context)
-            return seldon.predict(X_test), task_type or _get_task_type(seldon)
-
-        predictions, resolved_task_type = await anyio.to_thread.run_sync(_fit_predict)
-        if resolved_task_type == "classification":
-            metrics = compute_classification_metrics(y_test, predictions)
-        else:
-            metrics = compute_regression_metrics(y_test, predictions)
+        predictions = dataset.decode_predictions(response["predictions"], label_classes)
+        probabilities = response.get("probabilities") if use_probabilities else None
 
         result = {
-            "task_type": resolved_task_type,
-            "model": model or config.seldon_default_model,
-            "num_context_samples": len(X_context),
-            "num_test_samples": len(X_test),
-            "metrics": metrics,
+            "source": "prediction_api",
+            "request_id": response.get("request_id"),
+            "model": response.get("model") or resolved_model,
+            "task_type": problem_type,
+            "num_context_samples": len(X_train),
+            "num_predict_samples": len(X_test),
+            "feature_columns": feature_names,
             "target_column": target_column,
-            "feature_columns": list(X_context.columns),
+            "credits_consumed": response.get("credits_consumed"),
+            "latency_ms": response.get("latency_ms"),
         }
-
+        await _attach_download(ctx, result, predictions, probabilities)
+        _truncate_predictions(result, predictions, probabilities, max_predictions)
         return json.dumps(result, default=str)
 
-    except (FileNotFoundError, ValueError) as e:
-        return json.dumps({"error": str(e)})
+    except ValueError as e:
+        return json.dumps({"error": _sanitize_error(e, config, req_key)})
     except NeuralkException as e:
-        return json.dumps({"error": f"Neuralk API error: {_sanitize_error(e, config, req_key)}"})
+        return _sdk_error(e, config, req_key)
     except Exception as e:
-        return json.dumps({"error": f"Evaluation failed: {_sanitize_error(e, config, req_key)}"})
+        return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
+
+
+@mcp.tool()
+async def upload_data(
+    ctx: Context,
+    data: str,
+    target_column: str,
+    predict_data: str | None = None,
+    feature_columns: list[str] | None = None,
+    model: str | None = None,
+    task_type: str | None = None,
+    holdout_size: float = 0.2,
+    random_state: int = 42,
+    dataset_name: str = "inline",
+    ttl_days: int | None = None,
+) -> str:
+    """Upload an inline dataset to Neuralk and return its dataset_id (no inference).
+
+    Use this to upload once and then predict many times via predict(dataset_key=...)
+    — e.g. comparing models on the same data. The data is passed inline as CSV text
+    (no files), so keep it small; for large datasets upload directly to Neuralk and
+    pass the returned dataset_id to predict().
+
+    Returns the dataset_id (pass it to predict() as dataset_key — they are the same
+    identifier) plus, for classification targets, the label_classes you should pass
+    to predict() to decode integer-coded predictions back to labels.
+
+    Args:
+        data: Labeled data as CSV text.
+        target_column: Name of the target/label column.
+        predict_data: CSV text of unlabeled rows to predict on. If omitted, holds out from data.
+        feature_columns: Columns to use as features. If omitted, uses all columns except target.
+        model: Seldon model variant recorded in the archive metadata. Defaults to server config.
+        task_type: Force "classification" or "regression". If omitted, inferred from the target.
+        holdout_size: Fraction to hold out for prediction when predict_data is omitted. Defaults to 0.2.
+        random_state: Random seed for the holdout split. Defaults to 42.
+        dataset_name: Name recorded in the archive metadata. Defaults to "inline".
+        ttl_days: Retention tier in days before Neuralk auto-deletes the dataset —
+            one of 1, 7, 30, 90. If omitted, falls back to the server's configured
+            default, else Neuralk's own default (90 days). After expiry the
+            dataset_id returns a 404.
+    """
+    config = _get_config(ctx)
+    req_key = _get_request_api_key(ctx)
+
+    try:
+        client = await _build_sdk_client(ctx, config)
+        resolved_ttl = ttl_days if ttl_days is not None else config.seldon_upload_ttl_days
+        if resolved_ttl is not None and resolved_ttl not in neuralk_sdk.ALLOWED_TTL_DAYS:
+            allowed = ", ".join(str(d) for d in neuralk_sdk.ALLOWED_TTL_DAYS)
+            raise ValueError(f"Invalid ttl_days {resolved_ttl!r}. Allowed retention tiers (days): {allowed}.")
+
+        X_train, y_train, X_test, label_classes, _, problem_type = _build_inline_arrays(
+            data=data, target_column=target_column, predict_data=predict_data,
+            feature_columns=feature_columns, model=model, task_type=task_type,
+            holdout_size=holdout_size, random_state=random_state,
+        )
+
+        resolved_model = model or config.seldon_default_model
+
+        upload = await anyio.to_thread.run_sync(
+            lambda: neuralk_sdk.upload_dataset(
+                client, X_train=X_train, y_train=y_train, X_test=X_test,
+                model=resolved_model, problem_type=problem_type,
+                dataset_name=dataset_name, ttl_days=resolved_ttl,
+            )
+        )
+
+        result = {
+            "source": "prediction_api",
+            "dataset_id": upload["dataset_id"],
+            "bytes": upload.get("bytes"),
+            "etag": upload.get("etag"),
+            "ttl_days": upload.get("ttl_days"),
+            "model": resolved_model,
+            "num_train_samples": len(X_train),
+            "num_test_samples": len(X_test),
+        }
+        if label_classes is not None:
+            result["label_classes"] = label_classes
+        return json.dumps(result, default=str)
+
+    except ValueError as e:
+        return json.dumps({"error": _sanitize_error(e, config, req_key)})
+    except NeuralkException as e:
+        return _sdk_error(e, config, req_key)
+    except Exception as e:
+        return json.dumps({"error": f"Upload failed: {_sanitize_error(e, config, req_key)}"})
+
+
+@mcp.tool()
+async def create_upload(ctx: Context, num_parts: int = 1) -> str:
+    """Begin a presigned upload to Neuralk and return URL(s) to upload bytes to.
+
+    Use this to upload a real FILE without the data passing through this server or
+    the conversation. The Neuralk API key stays on the server — the returned
+    presigned URLs require NO key. Flow: call this, build the tar+zstd archive and
+    PUT it to the returned url(s) (capturing each ETag), then call complete_upload,
+    then predict(dataset_key). See the `drop_and_predict` prompt for the full recipe.
+
+    Args:
+        num_parts: Number of upload parts. Use 1 for archives under 5GB (a single
+            PUT); use more only for very large multipart uploads.
+
+    The response is self-describing: it includes `archive_spec` (exactly what to
+    build) and `recipe` (ready-to-run Python with the presigned URL filled in), so
+    you do not need this server's source code to perform the upload.
+
+    Returns {dataset_key, upload_id, parts, expires_seconds, archive_spec, recipe, next_steps}.
+    """
+    config = _get_config(ctx)
+    req_key = _get_request_api_key(ctx)
+    try:
+        api_key = await _get_api_key(ctx, config)
+        key = f"auto/{uuid.uuid4().hex}.tar.zst"
+        init = await multipart_init(base_url=config.neuralk_prediction_url, api_key=api_key, key=key)
+        signed = await multipart_sign(
+            base_url=config.neuralk_prediction_url, api_key=api_key,
+            upload_id=init["upload_id"], key=key, part_count=num_parts,
+        )
+        parts = signed.get("parts") or []
+        first_url = parts[0]["url"] if parts else "<presigned url>"
+        recipe = (
+            "pip install numpy pandas zstandard\n\n"
+            + _DROP_AND_PREDICT_SNIPPET
+            .replace("__FILE__", "<path to your CSV>")
+            .replace("__TARGET__", "<target column>")
+            .replace("<paste parts[0].url from create_upload>", first_url)
+        )
+        return json.dumps({
+            "dataset_key": key,
+            "upload_id": init["upload_id"],
+            "parts": parts,
+            "expires_seconds": signed.get("expires_seconds"),
+            "archive_spec": _UPLOAD_ARCHIVE_SPEC,
+            "recipe": recipe,
+            "next_steps": (
+                "1) Build the tar+zstd archive per archive_spec (or run `recipe`), setting "
+                "PROBLEM_TYPE and MODEL. 2) PUT the archive bytes to parts[0].url and capture the "
+                "ETag response header. 3) call complete_upload(upload_id, dataset_key, "
+                'parts=[{"part_number": 1, "etag": <etag>}]). 4) call predict(dataset_key, '
+                "label_classes) — pass label_classes from the recipe output to decode predictions."
+            ),
+        })
+    except ValueError as e:
+        return json.dumps({"error": _sanitize_error(e, config, req_key)})
+    except PredictionAPIError as e:
+        return _presigned_error(e, config, req_key)
+    except Exception as e:
+        return json.dumps({"error": f"Create upload failed: {_sanitize_error(e, config, req_key)}"})
+
+
+@mcp.tool()
+async def complete_upload(ctx: Context, upload_id: str, dataset_key: str, parts: list[dict]) -> str:
+    """Finalize a presigned upload started with create_upload.
+
+    Args:
+        upload_id: The upload_id returned by create_upload.
+        dataset_key: The dataset_key returned by create_upload.
+        parts: Ordered list of {"part_number": int, "etag": str} from your PUT
+            responses (the ETag response header of each part upload).
+
+    Returns {dataset_key} to pass to predict().
+    """
+    config = _get_config(ctx)
+    req_key = _get_request_api_key(ctx)
+    try:
+        api_key = await _get_api_key(ctx, config)
+        result = await multipart_complete(
+            base_url=config.neuralk_prediction_url, api_key=api_key,
+            upload_id=upload_id, key=dataset_key, parts=parts,
+        )
+        return json.dumps({"dataset_key": result.get("key", dataset_key), "location": result.get("location")})
+    except ValueError as e:
+        return json.dumps({"error": _sanitize_error(e, config, req_key)})
+    except PredictionAPIError as e:
+        return _presigned_error(e, config, req_key)
+    except Exception as e:
+        return json.dumps({"error": f"Complete upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
 @mcp.tool()
@@ -483,59 +812,238 @@ async def get_available_models() -> str:
 @mcp.resource("seldon://config")
 async def get_config_resource() -> str:
     """Current Seldon MCP server configuration (API key masked)."""
-    # Access the lifespan config via a module-level ref set during startup
     config = _lifespan_config
     if config is None:
         return json.dumps({"error": "Server not fully initialized"})
     return json.dumps({
         "default_model": config.seldon_default_model,
-        "host": config.neuralk_host or "cloud (api.neuralk-ai.com)",
-        "data_dir": config.seldon_data_dir,
-        "api_key": (config.neuralk_api_key[:8] + "...") if config.neuralk_api_key else "not set",
+        "prediction_url": config.neuralk_prediction_url,
+        "api_key": "set" if config.neuralk_api_key else "not set",
     })
 
 
 # --- MCP Prompts ---
 
 
+_DROP_AND_PREDICT_SNIPPET = '''import io, json, tarfile, urllib.request
+import numpy as np, pandas as pd, zstandard as zstd
+
+CSV_PATH = "__FILE__"
+TARGET = "__TARGET__"
+PROBLEM_TYPE = "classification"   # set to "regression" for continuous targets
+MODEL = "seldon-small"            # seldon-small | seldon-flash | seldon-large
+PRESIGNED_URL = "<paste parts[0].url from create_upload>"
+HOLDOUT = 0.2
+
+df = pd.read_csv(CSV_PATH)
+y_raw = df[TARGET].to_numpy()
+X = pd.get_dummies(df.drop(columns=[TARGET])).to_numpy(dtype=np.float32)
+
+# y dtype must match the task: float64 for regression, int64 for classification
+if PROBLEM_TYPE == "regression":
+    y, label_classes = y_raw.astype(np.float64), None
+elif y_raw.dtype.kind in "OUS":           # string labels -> integer codes
+    classes, codes = np.unique(y_raw, return_inverse=True)
+    y, label_classes = codes.astype(np.int64), classes.tolist()
+else:
+    y, label_classes = y_raw.astype(np.int64), None
+
+# hold out a RANDOM subset to predict on; train on the rest. Shuffling avoids the
+# order bias of taking the first rows. Note: feature encoding here (pd.get_dummies)
+# is simpler than the server's predict_from_data path (skrub TableVectorizer), so
+# results may differ slightly between the two entry points.
+rng = np.random.default_rng(0)
+perm = rng.permutation(len(X))
+k = max(1, int(len(X) * HOLDOUT))
+test_idx, train_idx = perm[:k], perm[k:]
+X_test, X_train, y_train = X[test_idx], X[train_idx], y[train_idx]
+
+def npy(a):
+    b = io.BytesIO(); np.save(b, np.ascontiguousarray(a), allow_pickle=False); return b.getvalue()
+
+meta = {"method": "fit_predict", "model": MODEL, "dataset": "dropped", "prompter_config": None,
+        "problem_type": PROBLEM_TYPE, "memory_optimization": PROBLEM_TYPE == "regression",
+        "preprocess": True, "metadata": {}, "user": "", "version": 1}
+members = {"metadata.json": json.dumps(meta).encode(),
+          "X_train.npy": npy(X_train), "y_train.npy": npy(y_train), "X_test.npy": npy(X_test)}
+
+raw = io.BytesIO()
+with tarfile.open(fileobj=raw, mode="w") as tar:
+    for name, data in members.items():
+        ti = tarfile.TarInfo(name); ti.size = len(data); tar.addfile(ti, io.BytesIO(data))
+archive = zstd.ZstdCompressor(level=6).compress(raw.getvalue())
+
+req = urllib.request.Request(PRESIGNED_URL, data=archive, method="PUT")
+with urllib.request.urlopen(req) as resp:
+    etag = resp.headers.get("ETag")
+print(json.dumps({"etag": etag, "label_classes": label_classes}))
+'''
+
+
 @mcp.prompt()
-def classify(file_path: str, target_column: str) -> str:
-    """Guide a classification workflow: describe data, predict, and evaluate."""
+def drop_and_predict(file_path: str, target_column: str) -> str:
+    """Recipe to upload a dropped data file to Neuralk and predict (file-free server)."""
+    snippet = _DROP_AND_PREDICT_SNIPPET.replace("__FILE__", file_path).replace("__TARGET__", target_column)
     return (
-        f"I have a classification dataset at '{file_path}' with target column '{target_column}'.\n\n"
-        "Please:\n"
-        "1. First describe the data using the describe_data tool to understand its structure.\n"
-        "2. Then make predictions using the predict tool.\n"
-        "3. Evaluate the model using the evaluate tool to see accuracy, F1, and other metrics.\n"
-        "4. Summarize the results and suggest if a different model variant might improve performance."
+        "This MCP server never reads files. To predict on the dropped file, the upload is done "
+        "by YOU in code execution (the file never reaches this server), and the Neuralk API key "
+        "stays on the server. Steps:\n\n"
+        "1. Call the `create_upload` tool. It returns `dataset_key`, `upload_id`, and "
+        "`parts` (a list with a presigned upload URL at `parts[0].url`).\n\n"
+        "2. In code execution, install deps and run the script below — paste `parts[0].url` into "
+        "PRESIGNED_URL, and set PROBLEM_TYPE (\"classification\" or \"regression\") and MODEL "
+        "(seldon-small/seldon-flash/seldon-large). It builds the tar+zstd archive from the file and uploads "
+        "it directly to storage (no key needed), printing the `etag` and `label_classes`:\n"
+        "```bash\npip install numpy pandas zstandard\n```\n"
+        "```python\n" + snippet + "```\n\n"
+        "3. Call `complete_upload` with `upload_id`, `dataset_key`, and "
+        '`parts=[{"part_number": 1, "etag": <etag from step 2>}]`.\n\n'
+        "4. Call `predict` with `dataset_key` and the `label_classes` from step 2 to get "
+        "predictions (decoded back to the original labels).\n\n"
+        "For very large files, request more parts from `create_upload` and PUT each part "
+        "(min 5MB each) to its URL. For a small dataset you can skip all this and call "
+        "`predict_from_data` with the CSV text inline instead."
     )
 
 
-@mcp.prompt()
-def regress(file_path: str, target_column: str) -> str:
-    """Guide a regression workflow: describe data, predict, and evaluate."""
-    return (
-        f"I have a regression dataset at '{file_path}' with target column '{target_column}'.\n\n"
-        "Please:\n"
-        "1. First describe the data using the describe_data tool.\n"
-        "2. Make predictions using the predict tool.\n"
-        "3. Evaluate the model using the evaluate tool to see MAE, RMSE, and R2 scores.\n"
-        "4. Summarize the results."
+# --- HTTP routes ---
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> Response:
+    """Liveness and readiness probe: the process is up and serving."""
+    return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/downloads/{token}", methods=["GET"])
+async def download_predictions(request: Request) -> Response:
+    """Serve a full prediction CSV once, then delete it (single-use, expiring link)."""
+    store = _download_store
+    if store is None:
+        return PlainTextResponse("Downloads not available.", status_code=404)
+    token = request.path_params["token"]
+    data = await anyio.to_thread.run_sync(store.take, token)
+    if data is None:
+        return PlainTextResponse("Not found, already downloaded, or expired.", status_code=404)
+    return Response(
+        content=data,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="predictions.csv"'},
     )
 
 
-@mcp.prompt()
-def compare_models(file_path: str, target_column: str) -> str:
-    """Compare all three Seldon model variants on the same dataset."""
-    return (
-        f"I want to compare all three Seldon model variants on the dataset at '{file_path}' "
-        f"with target column '{target_column}'.\n\n"
-        "Please:\n"
-        "1. Describe the data first.\n"
-        "2. Evaluate seldon-flash, seldon-small, and seldon-large on the same holdout split "
-        "(use random_state=42 for consistency).\n"
-        "3. Create a comparison table of metrics across all three models.\n"
-        "4. Recommend which model to use and why."
+class RequireClientKeyMiddleware:
+    """Refuse MCP requests that carry no client API key (ASGI middleware).
+
+    The hosted deployment sets ``REQUIRE_CLIENT_API_KEY=true``: this server
+    holds no Neuralk key of its own, so an MCP request without one cannot do
+    anything useful and is answered ``401`` up front, naming the two accepted
+    headers. ``/healthz`` and the single-use ``/downloads`` links are not MCP
+    requests and pass through.
+    """
+
+    def __init__(self, app: Any, mcp_paths: set[str]) -> None:
+        self.app = app
+        self.mcp_paths = {p.rstrip("/") or "/" for p in mcp_paths}
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "").rstrip("/") or "/"
+            if path in self.mcp_paths and not _api_key_from_headers(Headers(scope=scope)):
+                response = JSONResponse(
+                    {
+                        "error": (
+                            "A Neuralk API key is required. Send it as the "
+                            f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. "
+                            "Create a key at https://prediction.neuralk-ai.com/dashboard/api-keys."
+                        )
+                    },
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="neuralk"'},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _configure_binding(host: str, port: int) -> None:
+    """Point FastMCP at the bind address and fix its transport security for it.
+
+    FastMCP turns DNS-rebinding protection on at construction because its
+    default host is loopback, and that protection accepts only loopback Host
+    headers. Behind an ingress every request carries the public name, so on a
+    non-loopback bind the check is turned off: the ingress in front is what
+    decides who reaches this process. On loopback the protection stays.
+    """
+    mcp.settings.host = host
+    mcp.settings.port = port
+    if host not in _LOOPBACK_HOSTS:
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+def build_http_app(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    *,
+    stateless: bool = True,
+    json_response: bool = True,
+):
+    """Build the ASGI app of the hosted server.
+
+    Serves the Streamable HTTP MCP endpoint at ``/mcp`` and at ``/`` (so a
+    client given either the bare host or the ``/mcp`` URL works), ``/healthz``
+    for probes and ``/downloads/<token>`` for large prediction sets. With
+    ``require_client_api_key`` set, MCP requests without a key are refused.
+
+    Args:
+        host: Address the server will bind (decides the transport security).
+        port: Port the server will bind.
+        stateless: No session state between requests, so any replica can
+            answer any request — the mode to run behind a load balancer.
+        json_response: Answer tool calls with a JSON body instead of an event
+            stream; simpler through proxies that buffer.
+
+    Returns:
+        The Starlette application.
+    """
+    from starlette.routing import Route
+
+    config = _init_state()
+    _configure_binding(host, port)
+    mcp.settings.stateless_http = stateless
+    mcp.settings.json_response = json_response
+
+    app = mcp.streamable_http_app()
+    mcp_path = mcp.settings.streamable_http_path
+    if mcp_path != "/":
+        mcp_route = next(r for r in app.routes if getattr(r, "path", None) == mcp_path)
+        # Reuse the exact same ASGI endpoint so / behaves identically to /mcp.
+        app.router.routes.append(Route("/", endpoint=mcp_route.endpoint))
+    if config.require_client_api_key:
+        app.add_middleware(RequireClientKeyMiddleware, mcp_paths={mcp_path, "/"})
+    return app
+
+
+def _serve_streamable_http(
+    host: str, port: int, *, stateless: bool, json_response: bool, forwarded_allow_ips: str
+) -> None:
+    """Run the hosted server under uvicorn."""
+    import uvicorn
+
+    app = build_http_app(host, port, stateless=stateless, json_response=json_response)
+    assert _download_store is not None  # built by build_http_app
+    _start_download_sweeper(_download_store)
+    logger.info(
+        "Serving Streamable HTTP on %s:%s (stateless=%s, json_response=%s, client key required=%s)",
+        host, port, stateless, json_response, bool(_lifespan_config and _lifespan_config.require_client_api_key),
+    )
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=mcp.settings.log_level.lower(),
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips,
     )
 
 
@@ -549,17 +1057,48 @@ def compare_models(file_path: str, target_column: str) -> str:
     default="stdio",
     help="MCP transport to use.",
 )
+@click.option("--host", type=str, default="127.0.0.1", help="Host to bind for SSE/HTTP transport.")
 @click.option("--port", type=int, default=8000, help="Port for SSE/HTTP transport.")
-def main(transport: str, port: int):
+@click.option(
+    "--stateless/--stateful",
+    default=True,
+    help="Streamable HTTP only: keep no session state between requests, so any replica can answer "
+    "any request (the mode to run behind a load balancer). Default: stateless.",
+)
+@click.option(
+    "--json-response/--sse-response",
+    default=True,
+    help="Streamable HTTP only: answer tool calls with a plain JSON body instead of an event stream. "
+    "Default: JSON.",
+)
+@click.option(
+    "--forwarded-allow-ips",
+    type=str,
+    default="127.0.0.1",
+    help="Proxies whose X-Forwarded-* headers are trusted (uvicorn's setting). "
+    "Use '*' behind an ingress you control.",
+)
+def main(
+    transport: str,
+    host: str,
+    port: int,
+    stateless: bool,
+    json_response: bool,
+    forwarded_allow_ips: str,
+) -> None:
     """Start the Seldon MCP server."""
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    _init_state()
 
     if transport == "stdio":
         mcp.run(transport="stdio")
-    elif transport == "sse":
-        mcp.run(transport="sse", port=port)
+    elif transport == "streamable-http":
+        _serve_streamable_http(
+            host, port, stateless=stateless, json_response=json_response, forwarded_allow_ips=forwarded_allow_ips
+        )
     else:
-        mcp.run(transport="streamable-http", port=port)
+        _configure_binding(host, port)
+        mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

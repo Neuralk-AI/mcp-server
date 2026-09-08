@@ -38,6 +38,9 @@ class _CacheEntry:
 
 
 _cache: dict[str, _CacheEntry] = {}
+# Bound the cache so a caller cycling through many distinct keys can't grow it
+# without limit. Only successful validations are cached (401/403 are not).
+_MAX_CACHE_ENTRIES = 1024
 
 
 def _cache_key(api_key: str, base_url: str) -> str:
@@ -90,6 +93,9 @@ async def validate_api_key(
             detail = response.json()
         except ValueError:
             detail = {}
+        # The body may be a list/scalar rather than a dict; only dig in when it's a dict.
+        if not isinstance(detail, dict):
+            detail = {}
         message = (
             detail.get("detail", {}).get("message")
             if isinstance(detail.get("detail"), dict)
@@ -99,15 +105,15 @@ async def validate_api_key(
             "or the terms of service have not been accepted."
         )
         raise APIKeyAuthError(message)
-    if response.status_code >= 500:
+    if response.status_code != 200:
+        # Anything else (5xx, or an unexpected 404/405/3xx — e.g. whoami not served
+        # on this host) fails open: skip pre-validation and let the downstream SDK
+        # call surface the real error rather than blocking a possibly-valid key.
         logger.warning(
-            "whoami returned %s at %s; skipping pre-validation", response.status_code, url
+            "whoami returned unexpected %s at %s; skipping pre-validation (fail-open)",
+            response.status_code, url,
         )
         raise _SkipValidation()
-    if response.status_code != 200:
-        raise APIKeyAuthError(
-            f"Unexpected response from {url}: HTTP {response.status_code}"
-        )
 
     data = response.json()
     result = WhoAmIResult(
@@ -121,6 +127,12 @@ async def validate_api_key(
     if not result.is_active:
         raise APIKeyAuthError("API key is no longer active.")
 
+    if len(_cache) >= _MAX_CACHE_ENTRIES:
+        # Reclaim expired entries; if still at capacity, evict the soonest-to-expire.
+        for stale in [k for k, v in _cache.items() if v.expires_at <= now]:
+            _cache.pop(stale, None)
+        if len(_cache) >= _MAX_CACHE_ENTRIES:
+            _cache.pop(min(_cache, key=lambda k: _cache[k].expires_at), None)
     _cache[cache_key] = _CacheEntry(result=result, expires_at=now + ttl_s)
     return result
 

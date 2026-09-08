@@ -1,0 +1,86 @@
+name: Image
+
+# Build the hosted server's container image and push it to the team registry.
+#
+# Deploying is still a deliberate act: this pushes an image, it does not touch
+# the cluster. Point deploy/helm/seldon-mcp/values-neuralk.yaml at the tag and
+# run the helm upgrade (deploy/README.md). There is no image-updater on this
+# release — the tag in values IS the record of what production runs.
+#
+# ONE SECRET IS NEEDED: SCW_REGISTRY_SECRET_KEY, a Scaleway API key with
+# ContainerRegistryFullAccess on the registry namespace (IAM application
+# seldon-mcp-ci). Settings -> Secrets and variables -> Actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to push on top of main-<sha>, e.g. v0.2.0
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - pyproject.toml
+      - uv.lock
+      - README.md
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/image.yml
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+env:
+  REPOSITORY: rg.fr-par.scw.cloud/neuralk-prod/seldon-mcp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: rg.fr-par.scw.cloud
+          username: nologin
+          password: ${{ secrets.SCW_REGISTRY_SECRET_KEY }}
+
+      - name: Work out the tags
+        id: tags
+        # Every build gets main-<sha>, so there is always an image that maps to
+        # an exact commit and a rollback never has to be reconstructed. A
+        # dispatch adds the release tag on top of the same digest.
+        run: |
+          sha="main-$(git rev-parse --short HEAD)"
+          tags="${REPOSITORY}:${sha}"
+          if [ -n "${{ inputs.version }}" ]; then
+            tags="${tags},${REPOSITORY}:${{ inputs.version }}"
+          fi
+          echo "list=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Pushing: ${tags}"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # linux/amd64 always: the nodes are x86, and an arm64 image fails at
+          # pull time with a message that never mentions architecture.
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.list }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Plain manifests, no OCI index, no attestation: kubelet never reads
+          # an attestation, and plain manifests are the form we can prove pulls
+          # everywhere.
+          provenance: false
+          sbom: false
+
+      - name: Say what has to happen next
+        run: |
+          echo "Pushed ${{ steps.tags.outputs.list }}"
+          echo "Nothing is deployed yet. Set image.tag in"
+          echo "deploy/helm/seldon-mcp/values-neuralk.yaml and helm upgrade (deploy/README.md)."

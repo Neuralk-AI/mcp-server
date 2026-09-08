@@ -11,9 +11,13 @@ wheels/
 
 # Environment
 .env
+neuralk-api-key
 
 # Data files
 *.csv
 *.json
 *.xlsx
 *.parquet
+
+# Archived local data
+archive/
