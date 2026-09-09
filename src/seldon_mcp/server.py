@@ -1125,6 +1125,32 @@ def build_http_app(
     return app
 
 
+def _warm_imports() -> None:
+    """Import the heavy dependencies the tools need (see the lazy imports above).
+
+    Run in a background thread once the server is up: the health check and
+    the first ``initialize`` do not wait for scikit-learn and skrub, and the
+    first tool call finds them loaded instead of paying for the import inside
+    its own time budget (a serverless host cuts a tool call after 30 s, and a
+    cold import can take most of that on a small machine).
+    """
+    try:
+        t0 = time.monotonic()
+        _sdk()
+        t1 = time.monotonic()
+        _dataset()
+        t2 = time.monotonic()
+        logger.info("Tool imports warmed: neuralk %.1fs, dataset %.1fs", t1 - t0, t2 - t1)
+    except Exception:  # pragma: no cover - a broken import surfaces on the first tool call anyway
+        logger.exception("Warming the tool imports failed")
+
+
+def _start_import_warmer() -> threading.Thread:
+    thread = threading.Thread(target=_warm_imports, name="seldon-import-warmer", daemon=True)
+    thread.start()
+    return thread
+
+
 def _serve_streamable_http(
     host: str, port: int, *, stateless: bool, json_response: bool, forwarded_allow_ips: str
 ) -> None:
@@ -1134,6 +1160,7 @@ def _serve_streamable_http(
     app = build_http_app(host, port, stateless=stateless, json_response=json_response)
     assert _download_store is not None  # built by build_http_app
     _start_download_sweeper(_download_store)
+    _start_import_warmer()
     logger.info(
         "Serving Streamable HTTP on %s:%s (stateless=%s, json_response=%s, client key required=%s)",
         host, port, stateless, json_response, bool(_lifespan_config and _lifespan_config.require_client_api_key),
