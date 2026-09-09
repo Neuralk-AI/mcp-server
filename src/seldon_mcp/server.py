@@ -1135,8 +1135,12 @@ def _warm_imports() -> None:
     cold import can take most of that on a small machine).
     """
     try:
+        t0 = time.monotonic()
         _sdk()
+        t1 = time.monotonic()
         _dataset()
+        t2 = time.monotonic()
+        logger.info("Tool imports warmed: neuralk %.1fs, dataset %.1fs", t1 - t0, t2 - t1)
     except Exception:  # pragma: no cover - a broken import surfaces on the first tool call anyway
         logger.exception("Warming the tool imports failed")
 
