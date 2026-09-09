@@ -17,6 +17,7 @@ import anyio
 import click
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -510,7 +511,28 @@ def _build_inline_arrays(
 # --- MCP Tools ---
 
 
-@mcp.tool()
+# --- Tool annotations ---
+#
+# The connector directories (Claude, ChatGPT) require every tool to carry a
+# title and the read-only / destructive hints; the model uses them to decide
+# what needs confirmation. Predictions read the user's data and return an
+# answer; uploads create a dataset in the user's own Neuralk account, which is
+# neither destructive nor publicly visible.
+
+
+def _reads(title: str, *, open_world: bool = True) -> ToolAnnotations:
+    return ToolAnnotations(
+        title=title, readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=open_world
+    )
+
+
+def _writes(title: str) -> ToolAnnotations:
+    return ToolAnnotations(
+        title=title, readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+
+
+@mcp.tool(annotations=_reads("Predict with Seldon"))
 async def predict(
     ctx: Context,
     dataset_key: str,
@@ -562,7 +584,7 @@ async def predict(
         return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Predict from inline data"))
 async def predict_from_data(
     ctx: Context,
     data: str,
@@ -646,7 +668,7 @@ async def predict_from_data(
         return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_writes("Upload a dataset"))
 async def upload_data(
     ctx: Context,
     data: str,
@@ -734,7 +756,7 @@ async def upload_data(
         return json.dumps({"error": f"Upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_writes("Start a multipart upload"))
 async def create_upload(ctx: Context, num_parts: int = 1) -> str:
     """Begin a presigned upload to Neuralk and return URL(s) to upload bytes to.
 
@@ -796,7 +818,7 @@ async def create_upload(ctx: Context, num_parts: int = 1) -> str:
         return json.dumps({"error": f"Create upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_writes("Complete a multipart upload"))
 async def complete_upload(ctx: Context, upload_id: str, dataset_key: str, parts: list[dict]) -> str:
     """Finalize a presigned upload started with create_upload.
 
@@ -825,7 +847,7 @@ async def complete_upload(ctx: Context, upload_id: str, dataset_key: str, parts:
         return json.dumps({"error": f"Complete upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List Seldon models", open_world=False))
 async def list_models() -> str:
     """List available Seldon model variants and their characteristics.
 
