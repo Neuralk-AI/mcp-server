@@ -190,6 +190,20 @@ class TestBuildHttpApp:
         assert mcp.settings.json_response is True
 
 
+# --- the import warmer ---
+
+
+class TestImportWarmer:
+    def test_warms_the_lazy_imports(self):
+        import sys
+
+        from seldon_mcp.server import _start_import_warmer
+
+        _start_import_warmer().join(timeout=120)
+        assert "seldon_mcp.dataset" in sys.modules
+        assert "seldon_mcp.neuralk_sdk" in sys.modules
+
+
 # --- process-wide state ---
 
 
