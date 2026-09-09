@@ -9,8 +9,8 @@ How `https://mcp.neuralk.ai` is run, and how to run another one. The chart is
 One stateless process behind the cluster's nginx ingress. It holds **no Neuralk
 key**: every MCP request carries the client's own key
 (`REQUIRE_CLIENT_API_KEY=true`), the server validates it against the prediction
-API and forwards the work. A request without a key is answered `401` before it
-reaches a tool. The server writes one kind of file — the single-use prediction
+API and forwards the work. A tool call without a key is answered `401` before it
+reaches the tool; discovery (`initialize`, `tools/list`) stays open. The server writes one kind of file — the single-use prediction
 CSVs behind `/downloads/<token>` — into an emptyDir that lives five minutes.
 
 Because those files are pod-local, the chart runs **one replica** and refuses

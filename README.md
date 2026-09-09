@@ -71,8 +71,8 @@ macOS, `%APPDATA%\Claude\` on Windows):
 }
 ```
 
-A request without a key is answered `401`; a rejected or revoked key is
-reported by the tool call with the reason.
+A tool call without a key is answered `401`; listing the tools needs no key.
+A rejected or revoked key is reported by the tool call with the reason.
 
 ## Tools
 
@@ -154,7 +154,7 @@ Environment variables, or a `.env` file next to the process:
 | Variable | Default | Description |
 |---|---|---|
 | `NEURALK_API_KEY` | unset | Server-level key, the fallback when a request carries none. Unset in hosted mode. |
-| `REQUIRE_CLIENT_API_KEY` | `false` | Hosted mode: refuse MCP requests without a client key (`401`); never use the server's key on a client's behalf. |
+| `REQUIRE_CLIENT_API_KEY` | `false` | Hosted mode: refuse tool calls without a client key (`401`), keep discovery (`initialize`, `tools/list`) open; never use the server's key on a client's behalf. |
 | `SELDON_PUBLIC_URL` | unset | Public base URL the download links are built from (`https://mcp.neuralk.ai`). Empty = each request's own URL. |
 | `NEURALK_PREDICTION_URL` | `https://api.prediction.neuralk-ai.com` | The prediction API, which also validates keys (`/api/v1/auth/whoami`). |
 | `SELDON_DEFAULT_MODEL` | `seldon-small` | Model when a tool call names none. |
@@ -179,8 +179,8 @@ uv run pytest
 ```
 
 Tests never reach the network (`pytest-socket`); every outbound call is mocked
-at the HTTP boundary. CI also builds the container, boots it and checks that an
-MCP request without a key is refused, and lints and renders the Helm chart with
+at the HTTP boundary. CI also builds the container, boots it and checks that a
+tool call without a key is refused, and lints and renders the Helm chart with
 the production values.
 
 ## License

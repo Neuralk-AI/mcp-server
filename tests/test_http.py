@@ -125,34 +125,45 @@ def _gated_app() -> Starlette:
     return app
 
 
+CALL = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_models", "arguments": {}}}
+INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}
+LIST = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+
+
 class TestRequireClientKeyMiddleware:
-    def test_mcp_without_key_is_401_with_challenge(self):
-        client = TestClient(_gated_app())
-        response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    def test_tool_call_without_key_is_401_with_challenge(self):
+        response = TestClient(_gated_app()).post("/mcp", json=CALL)
         assert response.status_code == 401
         assert response.headers["www-authenticate"].startswith("Bearer")
         assert "x-neuralk-api-key" in response.json()["error"]
 
-    def test_root_without_key_is_401(self):
-        assert TestClient(_gated_app()).post("/").status_code == 401
+    def test_discovery_without_key_passes(self):
+        client = TestClient(_gated_app())
+        for body in (INIT, LIST, {"jsonrpc": "2.0", "method": "notifications/initialized"}):
+            response = client.post("/mcp", json=body)
+            assert response.status_code == 200, body
+            assert response.text == "served"
+
+    def test_batch_with_a_tool_call_is_gated(self):
+        assert TestClient(_gated_app()).post("/mcp", json=[LIST, CALL]).status_code == 401
+
+    def test_unparseable_body_is_left_to_the_transport(self):
+        assert TestClient(_gated_app()).post("/mcp", content=b"not json").status_code == 200
+
+    def test_root_without_key_is_gated(self):
+        assert TestClient(_gated_app()).post("/", json=CALL).status_code == 401
 
     def test_trailing_slash_is_gated_too(self):
-        assert TestClient(_gated_app()).post("/mcp/").status_code == 401
+        assert TestClient(_gated_app()).post("/mcp/", json=CALL).status_code == 401
 
-    def test_mcp_with_x_header_passes(self):
-        response = TestClient(_gated_app()).post("/mcp", headers={"x-neuralk-api-key": "nk_a"})
+    def test_tool_call_with_x_header_passes(self):
+        response = TestClient(_gated_app()).post("/mcp", json=CALL, headers={"x-neuralk-api-key": "nk_a"})
         assert response.status_code == 200
         assert response.text == "served"
 
-    def test_mcp_with_bearer_passes(self):
-        response = TestClient(_gated_app()).post("/mcp", headers={"Authorization": "Bearer nk_a"})
+    def test_tool_call_with_bearer_passes(self):
+        response = TestClient(_gated_app()).post("/mcp", json=CALL, headers={"Authorization": "Bearer nk_a"})
         assert response.status_code == 200
-
-    def test_healthz_and_downloads_are_not_gated(self):
-        client = TestClient(_gated_app())
-        assert client.get("/healthz").status_code == 200
-        assert client.get("/downloads/abc").status_code == 200
-
 
 # --- the built app ---
 
@@ -163,8 +174,8 @@ class TestBuildHttpApp:
         app = build_http_app("0.0.0.0", 8000)
         client = TestClient(app)  # no lifespan: the routes alone are under test
         assert client.get("/healthz").text == "ok"
-        assert client.post("/mcp").status_code == 401
-        assert client.post("/").status_code == 401
+        assert client.post("/mcp", json=CALL).status_code == 401
+        assert client.post("/", json=CALL).status_code == 401
         assert client.get("/downloads/nope").status_code == 404
 
     def test_non_loopback_bind_drops_dns_rebinding_protection(self):
