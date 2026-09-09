@@ -11,18 +11,17 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 import click
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from neuralk.exceptions import NeuralkException, NeuralkTermsNotAcceptedError
+from mcp.types import ToolAnnotations
 from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
-from seldon_mcp import dataset, neuralk_sdk
 from seldon_mcp.auth import APIKeyAuthError, _SkipValidation, validate_api_key
 from seldon_mcp.config import SeldonConfig
 from seldon_mcp.downloads import DownloadStore
@@ -32,6 +31,37 @@ from seldon_mcp.prediction_client import (
     multipart_init,
     multipart_sign,
 )
+
+if TYPE_CHECKING:
+    from neuralk.exceptions import NeuralkException
+
+# --- Lazy imports ---
+#
+# ``neuralk`` imports scikit-learn and ``seldon_mcp.dataset`` imports skrub, a
+# few seconds of CPU on a small machine. Every tool needs them; startup does
+# not, and on a serverless host startup is what the health check times. So
+# both are imported the first time a tool touches them. An ``except``
+# expression is evaluated only when an exception propagates, so
+# ``except _neuralk_exception() as e`` costs nothing until a call fails.
+
+
+def _dataset():
+    from seldon_mcp import dataset
+
+    return dataset
+
+
+def _sdk():
+    from seldon_mcp import neuralk_sdk
+
+    return neuralk_sdk
+
+
+def _neuralk_exception() -> type[Exception]:
+    from neuralk.exceptions import NeuralkException
+
+    return NeuralkException
+
 
 logger = logging.getLogger("seldon_mcp")
 
@@ -250,6 +280,8 @@ Key things to know:
 
 
 API_KEY_HEADER = "x-neuralk-api-key"
+# The header MCP hosting platforms (Alpic among them) use for API-key auth.
+GENERIC_API_KEY_HEADER = "x-api-key"
 AUTHORIZATION_HEADER = "authorization"
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -262,7 +294,8 @@ def _get_config(ctx: Context) -> SeldonConfig:
 def _api_key_from_headers(headers: Any) -> str | None:
     """Read the client's Neuralk API key from HTTP headers.
 
-    Two spellings are accepted: the ``x-neuralk-api-key`` header, and the
+    Three spellings are accepted: the ``x-neuralk-api-key`` header, the
+    generic ``x-api-key`` header that MCP hosting platforms forward, and the
     MCP-conventional ``Authorization: Bearer <key>``, so any client that can
     send one static header can connect.
 
@@ -270,11 +303,12 @@ def _api_key_from_headers(headers: Any) -> str | None:
         headers: A mapping with ``get`` (Starlette headers or a plain dict).
 
     Returns:
-        The key, or None when neither header carries one.
+        The key, or None when no header carries one.
     """
-    key = headers.get(API_KEY_HEADER)
-    if key and key.strip():
-        return key.strip()
+    for name in (API_KEY_HEADER, GENERIC_API_KEY_HEADER):
+        key = headers.get(name)
+        if key and key.strip():
+            return key.strip()
     auth = headers.get(AUTHORIZATION_HEADER) or headers.get("Authorization") or ""
     scheme, _, token = auth.partition(" ")
     if scheme.lower() == "bearer" and token.strip():
@@ -349,6 +383,8 @@ def _sdk_error(e: NeuralkException, config: SeldonConfig, req_key: str | None) -
     Terms-of-service rejections get a targeted message pointing at the terms URL,
     since the fix (an org accepting the ToS) is out of this server's hands.
     """
+    from neuralk.exceptions import NeuralkTermsNotAcceptedError
+
     if isinstance(e, NeuralkTermsNotAcceptedError):
         detail = (
             "Neuralk Terms of Service not accepted for this organization. "
@@ -380,7 +416,7 @@ def _presigned_error(e: PredictionAPIError, config: SeldonConfig, req_key: str |
 async def _build_sdk_client(ctx: Context, config: SeldonConfig):
     """Resolve+validate the API key and construct a neuralk SDK client for this request."""
     api_key = await _get_api_key(ctx, config)
-    return neuralk_sdk.build_client(api_key, config.neuralk_prediction_url)
+    return _sdk().build_client(api_key, config.neuralk_prediction_url)
 
 
 # --- Inline-data helpers (no filesystem access) ---
@@ -460,13 +496,13 @@ def _build_inline_arrays(
     Returns (X_train, y_train, X_test, label_classes, feature_names, problem_type).
     Shared by the inline upload_data and predict_from_data tools. No filesystem access.
     """
-    df = dataset.parse_csv(data)
+    df = _dataset().parse_csv(data)
     _validate_params(
         holdout_size, model, df.height,
         has_separate_file=predict_data is not None, task_type=task_type,
     )
-    predict_df = dataset.parse_csv(predict_data) if predict_data else None
-    return dataset.prepare_arrays(
+    predict_df = _dataset().parse_csv(predict_data) if predict_data else None
+    return _dataset().prepare_arrays(
         df, target_column, predict_df=predict_df, feature_columns=feature_columns,
         holdout_size=holdout_size, random_state=random_state, problem_type=task_type,
     )
@@ -475,7 +511,28 @@ def _build_inline_arrays(
 # --- MCP Tools ---
 
 
-@mcp.tool()
+# --- Tool annotations ---
+#
+# The connector directories (Claude, ChatGPT) require every tool to carry a
+# title and the read-only / destructive hints; the model uses them to decide
+# what needs confirmation. Predictions read the user's data and return an
+# answer; uploads create a dataset in the user's own Neuralk account, which is
+# neither destructive nor publicly visible.
+
+
+def _reads(title: str, *, open_world: bool = True) -> ToolAnnotations:
+    return ToolAnnotations(
+        title=title, readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=open_world
+    )
+
+
+def _writes(title: str) -> ToolAnnotations:
+    return ToolAnnotations(
+        title=title, readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+
+
+@mcp.tool(annotations=_reads("Predict with Seldon"))
 async def predict(
     ctx: Context,
     dataset_key: str,
@@ -501,10 +558,10 @@ async def predict(
     try:
         client = await _build_sdk_client(ctx, config)
         response = await anyio.to_thread.run_sync(
-            lambda: neuralk_sdk.predict_by_reference(client, dataset_key)
+            lambda: _sdk().predict_by_reference(client, dataset_key)
         )
 
-        predictions = dataset.decode_predictions(response["predictions"], label_classes)
+        predictions = _dataset().decode_predictions(response["predictions"], label_classes)
         probabilities = response.get("probabilities")
 
         result = {
@@ -521,13 +578,13 @@ async def predict(
 
     except ValueError as e:
         return json.dumps({"error": _sanitize_error(e, config, req_key)})
-    except NeuralkException as e:
+    except _neuralk_exception() as e:
         return _sdk_error(e, config, req_key)
     except Exception as e:
         return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Predict from inline data"))
 async def predict_from_data(
     ctx: Context,
     data: str,
@@ -578,13 +635,13 @@ async def predict_from_data(
         resolved_model = model or config.seldon_default_model
 
         response = await anyio.to_thread.run_sync(
-            lambda: neuralk_sdk.predict_inline(
+            lambda: _sdk().predict_inline(
                 client, X_train=X_train, y_train=y_train, X_test=X_test,
                 model=resolved_model, problem_type=problem_type, dataset_name=dataset_name,
             )
         )
 
-        predictions = dataset.decode_predictions(response["predictions"], label_classes)
+        predictions = _dataset().decode_predictions(response["predictions"], label_classes)
         probabilities = response.get("probabilities") if use_probabilities else None
 
         result = {
@@ -605,13 +662,13 @@ async def predict_from_data(
 
     except ValueError as e:
         return json.dumps({"error": _sanitize_error(e, config, req_key)})
-    except NeuralkException as e:
+    except _neuralk_exception() as e:
         return _sdk_error(e, config, req_key)
     except Exception as e:
         return json.dumps({"error": f"Prediction failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_writes("Upload a dataset"))
 async def upload_data(
     ctx: Context,
     data: str,
@@ -657,8 +714,8 @@ async def upload_data(
     try:
         client = await _build_sdk_client(ctx, config)
         resolved_ttl = ttl_days if ttl_days is not None else config.seldon_upload_ttl_days
-        if resolved_ttl is not None and resolved_ttl not in neuralk_sdk.ALLOWED_TTL_DAYS:
-            allowed = ", ".join(str(d) for d in neuralk_sdk.ALLOWED_TTL_DAYS)
+        if resolved_ttl is not None and resolved_ttl not in _sdk().ALLOWED_TTL_DAYS:
+            allowed = ", ".join(str(d) for d in _sdk().ALLOWED_TTL_DAYS)
             raise ValueError(f"Invalid ttl_days {resolved_ttl!r}. Allowed retention tiers (days): {allowed}.")
 
         X_train, y_train, X_test, label_classes, _, problem_type = _build_inline_arrays(
@@ -670,7 +727,7 @@ async def upload_data(
         resolved_model = model or config.seldon_default_model
 
         upload = await anyio.to_thread.run_sync(
-            lambda: neuralk_sdk.upload_dataset(
+            lambda: _sdk().upload_dataset(
                 client, X_train=X_train, y_train=y_train, X_test=X_test,
                 model=resolved_model, problem_type=problem_type,
                 dataset_name=dataset_name, ttl_days=resolved_ttl,
@@ -693,13 +750,13 @@ async def upload_data(
 
     except ValueError as e:
         return json.dumps({"error": _sanitize_error(e, config, req_key)})
-    except NeuralkException as e:
+    except _neuralk_exception() as e:
         return _sdk_error(e, config, req_key)
     except Exception as e:
         return json.dumps({"error": f"Upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_writes("Start a multipart upload"))
 async def create_upload(ctx: Context, num_parts: int = 1) -> str:
     """Begin a presigned upload to Neuralk and return URL(s) to upload bytes to.
 
@@ -761,7 +818,7 @@ async def create_upload(ctx: Context, num_parts: int = 1) -> str:
         return json.dumps({"error": f"Create upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_writes("Complete a multipart upload"))
 async def complete_upload(ctx: Context, upload_id: str, dataset_key: str, parts: list[dict]) -> str:
     """Finalize a presigned upload started with create_upload.
 
@@ -790,7 +847,7 @@ async def complete_upload(ctx: Context, upload_id: str, dataset_key: str, parts:
         return json.dumps({"error": f"Complete upload failed: {_sanitize_error(e, config, req_key)}"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List Seldon models", open_world=False))
 async def list_models() -> str:
     """List available Seldon model variants and their characteristics.
 
@@ -1047,6 +1104,38 @@ def _serve_streamable_http(
     )
 
 
+def serve(
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    *,
+    stateless: bool = True,
+    json_response: bool = True,
+    forwarded_allow_ips: str = "127.0.0.1",
+) -> None:
+    """Start the server on the given transport; the entry point behind the CLI.
+
+    Args:
+        transport: ``stdio``, ``sse`` or ``streamable-http``.
+        host: Bind address for the HTTP transports.
+        port: Bind port for the HTTP transports.
+        stateless: Streamable HTTP only, see :func:`build_http_app`.
+        json_response: Streamable HTTP only, see :func:`build_http_app`.
+        forwarded_allow_ips: Proxies whose ``X-Forwarded-*`` headers are trusted.
+    """
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    _init_state()
+
+    if transport == "streamable-http":
+        _serve_streamable_http(
+            host, port, stateless=stateless, json_response=json_response, forwarded_allow_ips=forwarded_allow_ips
+        )
+        return
+    if transport != "stdio":
+        _configure_binding(host, port)
+    mcp.run(transport=transport)
+
+
 # --- CLI ---
 
 
@@ -1087,18 +1176,14 @@ def main(
     forwarded_allow_ips: str,
 ) -> None:
     """Start the Seldon MCP server."""
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-    _init_state()
-
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-    elif transport == "streamable-http":
-        _serve_streamable_http(
-            host, port, stateless=stateless, json_response=json_response, forwarded_allow_ips=forwarded_allow_ips
-        )
-    else:
-        _configure_binding(host, port)
-        mcp.run(transport=transport)
+    serve(
+        transport,
+        host,
+        port,
+        stateless=stateless,
+        json_response=json_response,
+        forwarded_allow_ips=forwarded_allow_ips,
+    )
 
 
 if __name__ == "__main__":

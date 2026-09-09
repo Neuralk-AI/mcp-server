@@ -1,0 +1,5 @@
+{
+  "$schema": "https://assets.alpic.ai/alpic.json",
+  "installCommand": "uv sync --locked --no-dev --compile-bytecode",
+  "startCommand": "uv run --no-sync main.py"
+}

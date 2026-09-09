@@ -16,8 +16,12 @@ neuralk-api-key
 # Data files
 *.csv
 *.json
+!alpic.json
 *.xlsx
 *.parquet
 
 # Archived local data
 archive/
+
+# Alpic CLI local link
+.alpic
