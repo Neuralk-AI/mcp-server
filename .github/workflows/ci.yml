@@ -113,7 +113,11 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp \
             -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
-          test "$code" = "401" || { echo "expected 401 without a key, got $code"; docker logs mcp; exit 1; }
+          test "$code" = "200" || { echo "expected 200 for initialize without a key (discovery is open), got $code"; docker logs mcp; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_models","arguments":{}}}')
+          test "$code" = "401" || { echo "expected 401 for a tool call without a key, got $code"; docker logs mcp; exit 1; }
           docker rm -f mcp
 
   helm:

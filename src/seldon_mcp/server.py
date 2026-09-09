@@ -990,37 +990,81 @@ async def download_predictions(request: Request) -> Response:
 
 
 class RequireClientKeyMiddleware:
-    """Refuse MCP requests that carry no client API key (ASGI middleware).
+    """Refuse tool calls that carry no client API key (ASGI middleware).
 
     The hosted deployment sets ``REQUIRE_CLIENT_API_KEY=true``: this server
-    holds no Neuralk key of its own, so an MCP request without one cannot do
-    anything useful and is answered ``401`` up front, naming the two accepted
-    headers. ``/healthz`` and the single-use ``/downloads`` links are not MCP
+    holds no Neuralk key of its own, so a ``tools/call`` without one cannot do
+    anything useful and is answered ``401`` up front, naming the accepted
+    headers. Discovery stays open: ``initialize``, ``tools/list`` and the other
+    read-only protocol methods answer without a key, so directories, catalogs
+    and audit tools can read the tool list before a user has configured a
+    key. ``/healthz`` and the single-use ``/downloads`` links are not MCP
     requests and pass through.
     """
+
+    GATED_METHODS = frozenset({"tools/call"})
 
     def __init__(self, app: Any, mcp_paths: set[str]) -> None:
         self.app = app
         self.mcp_paths = {p.rstrip("/") or "/" for p in mcp_paths}
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "http":
-            path = scope.get("path", "").rstrip("/") or "/"
-            if path in self.mcp_paths and not _api_key_from_headers(Headers(scope=scope)):
-                response = JSONResponse(
-                    {
-                        "error": (
-                            "A Neuralk API key is required. Send it as the "
-                            f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. "
-                            "Create a key at https://prediction.neuralk-ai.com/dashboard/api-keys."
-                        )
-                    },
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer realm="neuralk"'},
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "").rstrip("/") or "/"
+        if path not in self.mcp_paths or _api_key_from_headers(Headers(scope=scope)):
+            await self.app(scope, receive, send)
+            return
+
+        # No key: read the JSON-RPC body to see whether it is a tool call, then
+        # hand the app a receive() that replays what was consumed.
+        chunks: list[bytes] = []
+        more = True
+        while more:
+            message = await receive()
+            if message["type"] == "http.request":
+                chunks.append(message.get("body", b""))
+                more = message.get("more_body", False)
+            else:  # http.disconnect
+                more = False
+        body = b"".join(chunks)
+
+        if self._is_gated(body):
+            response = JSONResponse(
+                {
+                    "error": (
+                        "A Neuralk API key is required to call tools. Send it as the "
+                        f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. "
+                        "Create a key at https://prediction.neuralk-ai.com/dashboard/api-keys."
+                    )
+                },
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="neuralk"'},
+            )
+            await response(scope, receive, send)
+            return
+
+        replayed = False
+
+        async def replay() -> dict[str, Any]:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    @classmethod
+    def _is_gated(cls, body: bytes) -> bool:
+        """True when the JSON-RPC body (single message or batch) contains a gated method."""
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return False  # let the transport produce the parse error
+        messages = payload if isinstance(payload, list) else [payload]
+        return any(isinstance(m, dict) and m.get("method") in cls.GATED_METHODS for m in messages)
 
 
 def _configure_binding(host: str, port: int) -> None:
