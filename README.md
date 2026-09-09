@@ -1,4 +1,5 @@
 # Seldon MCP Server
+<!-- mcp-name: io.github.neuralk-ai/seldon-mcp -->
 
 An [MCP](https://modelcontextprotocol.io) server that gives AI assistants access
 to [Seldon](https://www.neuralk-ai.com), Neuralk's tabular foundation model for

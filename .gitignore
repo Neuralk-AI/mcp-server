@@ -17,6 +17,7 @@ neuralk-api-key
 *.csv
 *.json
 !alpic.json
+!server.json
 *.xlsx
 *.parquet
 

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.neuralk-ai/seldon-mcp",
+  "title": "Neuralk Seldon",
+  "description": "Predict any column of a table with Seldon, Neuralk's tabular foundation model. No training needed.",
+  "repository": {
+    "url": "https://github.com/Neuralk-AI/mcp-server",
+    "source": "github"
+  },
+  "websiteUrl": "https://docs.neuralk.ai/integrations/mcp.html",
+  "version": "0.2.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.neuralk.ai/mcp",
+      "headers": [
+        {
+          "name": "X-Neuralk-Api-Key",
+          "description": "Your Neuralk API key. Create one at https://prediction.neuralk.ai (Dashboard > API keys).",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
