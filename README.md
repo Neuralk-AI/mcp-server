@@ -14,26 +14,54 @@ upload straight to Neuralk (any size), and the server only holds the reference.
 ## Use the hosted server
 
 Neuralk runs this server at **`https://mcp.neuralk.ai/mcp`** (Streamable HTTP).
-Nothing to install: point your MCP client at it and send your own Neuralk API
-key on every request, as either header:
+Nothing to install. You are billed on your own Neuralk account.
 
-| Header | Value |
-|---|---|
-| `x-neuralk-api-key` | `nk_live_...` |
-| `Authorization` | `Bearer nk_live_...` |
+### Claude (web, Desktop, mobile), ChatGPT: sign in
 
-You are billed on your own account. Create a key at
-[prediction.neuralk-ai.com/dashboard/api-keys](https://prediction.neuralk-ai.com/dashboard/api-keys)
-or run `neuralk login`.
+1. In Claude, open **Settings → Connectors → Add custom connector**. On a Team
+   or Enterprise plan an Owner adds it once in **Organization settings →
+   Connectors**, then each member connects.
+2. Name it `Seldon`, URL `https://mcp.neuralk.ai/mcp`, and press **Add**.
+3. Press **Connect**. A Neuralk page opens: **Continue with Neuralk** signs you
+   in and creates an API key for the connection in your organization, or
+   paste a key you already have.
+
+That's it: you're sent back to Claude, which keeps the connection signed in.
+It works the same in ChatGPT and in any MCP client that supports OAuth. To
+disconnect for good, revoke the connection's key in your
+[dashboard](https://prediction.neuralk-ai.com/dashboard/api-keys).
+
+Creating a key at sign-in needs the admin or owner role in your Neuralk
+organization; members paste a key an admin gave them.
 
 ### Claude Code
+
+```bash
+claude mcp add --transport http seldon https://mcp.neuralk.ai/mcp
+```
+
+then run `/mcp` in Claude Code and pick `seldon` to sign in. Or skip the
+sign-in and pass a key:
 
 ```bash
 claude mcp add --transport http seldon https://mcp.neuralk.ai/mcp \
   --header "x-neuralk-api-key: nk_live_..."
 ```
 
-### Cursor, Windsurf, VS Code and other clients with a JSON config
+### Any client, with an API key header
+
+A client that doesn't do OAuth sends its Neuralk API key on every request, as
+either header:
+
+| Header | Value |
+|---|---|
+| `x-neuralk-api-key` | `nk_live_...` |
+| `Authorization` | `Bearer nk_live_...` |
+
+Create a key at
+[prediction.neuralk-ai.com/dashboard/api-keys](https://prediction.neuralk-ai.com/dashboard/api-keys)
+or run `neuralk login`. Cursor, Windsurf, VS Code and other clients with a
+JSON config:
 
 ```json
 {
@@ -48,11 +76,10 @@ claude mcp add --transport http seldon https://mcp.neuralk.ai/mcp \
 }
 ```
 
-### Claude Desktop
-
-Claude Desktop reaches remote servers through a local bridge. Add to
-`claude_desktop_config.json` (`~/Library/Application Support/Claude/` on
-macOS, `%APPDATA%\Claude\` on Windows):
+Claude Desktop through its config file instead of a connector goes through
+a local bridge. Add to `claude_desktop_config.json`
+(`~/Library/Application Support/Claude/` on macOS, `%APPDATA%\Claude\` on
+Windows) and restart it:
 
 ```json
 {
@@ -71,8 +98,9 @@ macOS, `%APPDATA%\Claude\` on Windows):
 }
 ```
 
-A tool call without a key is answered `401`; listing the tools needs no key.
-A rejected or revoked key is reported by the tool call with the reason.
+A request without credentials is answered `401` with an OAuth challenge,
+which is how a client knows to sign in. A rejected or revoked key is reported
+by the tool call with the reason.
 
 ## Tools
 
@@ -139,7 +167,8 @@ command expects, and [`alpic.json`](alpic.json) pins the install command. Set
 the environment's variables. Clients send their key as `x-api-key`,
 `x-neuralk-api-key` or `Authorization: Bearer`. Two limits of that runtime: a
 tool call is cut after 30 seconds, and only `/mcp` is routed, so the
-`/downloads/<token>` links for oversized prediction sets are not reachable there.
+`/downloads/<token>` links for oversized prediction sets are not reachable there,
+and neither is OAuth sign-in: leave `SELDON_OAUTH_SECRET` unset.
 
 ### On Kubernetes
 
@@ -154,13 +183,17 @@ Environment variables, or a `.env` file next to the process:
 | Variable | Default | Description |
 |---|---|---|
 | `NEURALK_API_KEY` | unset | Server-level key, the fallback when a request carries none. Unset in hosted mode. |
-| `REQUIRE_CLIENT_API_KEY` | `false` | Hosted mode: refuse tool calls without a client key (`401`), keep discovery (`initialize`, `tools/list`) open; never use the server's key on a client's behalf. |
+| `REQUIRE_CLIENT_API_KEY` | `false` | Hosted mode: refuse tool calls without a client key (`401`); never use the server's key on a client's behalf. Discovery (`initialize`, `tools/list`) stays open unless OAuth sign-in is on. |
 | `SELDON_PUBLIC_URL` | unset | Public base URL the download links are built from (`https://mcp.neuralk.ai`). Empty = each request's own URL. |
 | `NEURALK_PREDICTION_URL` | `https://api.prediction.neuralk-ai.com` | The prediction API, which also validates keys (`/api/v1/auth/whoami`). |
 | `SELDON_DEFAULT_MODEL` | `seldon-small` | Model when a tool call names none. |
 | `SELDON_UPLOAD_TTL_DAYS` | unset (Neuralk default, 90) | Retention of datasets uploaded by `upload_data`: 1, 7, 30 or 90. |
 | `SELDON_DOWNLOAD_DIR` | system temp | Where the single-use prediction files are written. |
 | `SELDON_DOWNLOAD_TTL_SECONDS` | `300` | How long they live. |
+| `SELDON_OAUTH_SECRET` | unset | Turns on OAuth sign-in (below). 32+ random characters; changing it signs every user out. Needs `SELDON_PUBLIC_URL`. |
+| `NEURALK_OIDC_CLIENT_ID` | unset | Keycloak client behind "Continue with Neuralk". Unset (or no secret), the sign-in page only takes an API key. |
+| `NEURALK_OIDC_CLIENT_SECRET` | unset | That client's secret. |
+| `NEURALK_OIDC_ISSUER` | `https://auth.neuralk-ai.com/realms/Neuralk` | The Neuralk Keycloak realm. |
 | `SKIP_API_KEY_VALIDATION` | `false` | Skip the upfront key check (not recommended). |
 | `API_KEY_VALIDATION_TTL_S` | `300` | Cache of successful key checks. |
 | `API_KEY_VALIDATION_TIMEOUT_S` | `5.0` | Timeout of the key check. |
@@ -169,6 +202,34 @@ Keys are validated against the auth API before a tool runs; a `401`/`403` comes
 back as a clear tool error rather than a traceback mid-inference. If the auth
 API is unreachable the check is skipped and the prediction call reports the
 real error itself. Keys never appear in logs or error messages.
+
+### OAuth sign-in
+
+With `SELDON_OAUTH_SECRET` set, the server is its own OAuth 2.1 authorization
+server, the flow MCP clients run on their own: a request without credentials
+gets a `401` pointing at `/.well-known/oauth-protected-resource/mcp`, the
+client registers itself (`/register`, RFC 7591), sends the user to
+`/authorize` with PKCE, and exchanges the code at `/token`. The page in
+between (`/oauth/consent`) signs the user in on the Neuralk Keycloak realm and
+creates an API key for the connection (`POST /api/v1/api-keys`, scopes
+`read` + `write`), or takes a key the user pastes.
+
+Nothing is stored. The client id, the code and both tokens are AES-GCM blobs
+under `SELDON_OAUTH_SECRET` that carry what they need, the API key included:
+a restart signs nobody out, and a token is worthless without the secret.
+Access tokens live an hour; refresh tokens are single-use (a minute of grace
+for a retried request). A sign-in lasts 90 days, then the user presses Connect
+again, and a key created at sign-in expires with it. A token cannot be
+revoked on its own: revoking the API key in the dashboard ends the connection
+within minutes (the key behind a token is re-checked every few minutes and
+on every refresh, and a rejected one sends the client back to sign-in), and
+rotating the secret ends all of them. What is single-use (codes, refresh
+tokens) is tracked in memory, which the chart's one replica makes enough.
+
+The sign-in page is tied to the browser that opened it (a `__Host-` cookie
+checked on its form and on the way back from Keycloak), accepts redirect URIs
+from an allowlist (https, http on loopback, native apps' private schemes),
+and says where the access goes.
 
 ## Development
 

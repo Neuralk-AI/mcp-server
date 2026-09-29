@@ -31,6 +31,18 @@ class SeldonConfig(BaseSettings):
     skip_api_key_validation: bool = False
     api_key_validation_ttl_s: int = 300
     api_key_validation_timeout_s: float = 5.0
+    # OAuth sign-in (seldon_mcp.oauth): set, it turns the hosted server into
+    # its own authorization server, so a Claude user connects with a Connect
+    # button instead of a header. Every token is sealed under this secret
+    # (32+ characters); rotating it signs every user out. Needs
+    # SELDON_PUBLIC_URL, which is the OAuth issuer.
+    seldon_oauth_secret: str | None = None
+    # "Continue with Neuralk" on the sign-in page: a confidential client of
+    # the Neuralk Keycloak realm, whose redirect URI is
+    # <SELDON_PUBLIC_URL>/oauth/callback. Unset, users paste an API key.
+    neuralk_oidc_issuer: str = "https://auth.neuralk-ai.com/realms/Neuralk"
+    neuralk_oidc_client_id: str | None = None
+    neuralk_oidc_client_secret: str | None = None
 
     @property
     def public_url(self) -> str | None:

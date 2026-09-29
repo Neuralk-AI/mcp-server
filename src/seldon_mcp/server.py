@@ -35,6 +35,8 @@ from seldon_mcp.prediction_client import (
 if TYPE_CHECKING:
     from neuralk.exceptions import NeuralkException
 
+    from seldon_mcp.oauth import OAuthServer
+
 # --- Lazy imports ---
 #
 # ``neuralk`` imports scikit-learn and ``seldon_mcp.dataset`` imports skrub, a
@@ -144,6 +146,8 @@ def _validate_params(
 _lifespan_config: SeldonConfig | None = None
 _download_store: DownloadStore | None = None
 _server_key_checked = False
+# OAuth sign-in, when SELDON_OAUTH_SECRET is set (built by build_http_app).
+_oauth: OAuthServer | None = None
 
 
 def _init_state(config: SeldonConfig | None = None) -> SeldonConfig:
@@ -291,29 +295,44 @@ def _get_config(ctx: Context) -> SeldonConfig:
     return ctx.request_context.lifespan_context["config"]
 
 
+def _bearer_token(headers: Any) -> str | None:
+    """The token of an ``Authorization: Bearer`` header, or None."""
+    auth = headers.get(AUTHORIZATION_HEADER) or headers.get("Authorization") or ""
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return None
+
+
+def _raw_credential(headers: Any) -> str | None:
+    """The credential a request carries, as sent: an API-key header, else a bearer token."""
+    for name in (API_KEY_HEADER, GENERIC_API_KEY_HEADER):
+        value = headers.get(name)
+        if value and value.strip():
+            return value.strip()
+    return _bearer_token(headers)
+
+
 def _api_key_from_headers(headers: Any) -> str | None:
     """Read the client's Neuralk API key from HTTP headers.
 
     Three spellings are accepted: the ``x-neuralk-api-key`` header, the
     generic ``x-api-key`` header that MCP hosting platforms forward, and the
     MCP-conventional ``Authorization: Bearer <key>``, so any client that can
-    send one static header can connect.
+    send one static header can connect. With OAuth sign-in on, the credential
+    may also be an access token this server issued, which carries the key.
 
     Args:
         headers: A mapping with ``get`` (Starlette headers or a plain dict).
 
     Returns:
-        The key, or None when no header carries one.
+        The key, or None when no header carries one, or when it is one of this
+        server's blobs but not a valid access token (never passed on as a key).
     """
-    for name in (API_KEY_HEADER, GENERIC_API_KEY_HEADER):
-        key = headers.get(name)
-        if key and key.strip():
-            return key.strip()
-    auth = headers.get(AUTHORIZATION_HEADER) or headers.get("Authorization") or ""
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() == "bearer" and token.strip():
-        return token.strip()
-    return None
+    credential = _raw_credential(headers)
+    if credential and _oauth is not None and _oauth.issued(credential):
+        return _oauth.api_key_for(credential)
+    return credential
 
 
 def _get_request_api_key(ctx: Context) -> str | None:
@@ -335,7 +354,9 @@ def _resolve_api_key(ctx: Context, config: SeldonConfig) -> str:
     if header_key:
         return header_key
 
-    if config.require_client_api_key:
+    # With sign-in on, every client brings its own credentials: a token that
+    # expired between the gate and here must not fall back to the server's key.
+    if config.require_client_api_key or _oauth is not None:
         raise ValueError(
             "This server needs your own Neuralk API key on every request: send it as the "
             f"'{API_KEY_HEADER}' header or as 'Authorization: Bearer <key>'. Create a key at "
@@ -990,7 +1011,7 @@ async def download_predictions(request: Request) -> Response:
 
 
 class RequireClientKeyMiddleware:
-    """Refuse tool calls that carry no client API key (ASGI middleware).
+    """Refuse MCP requests that carry no client credentials (ASGI middleware).
 
     The hosted deployment sets ``REQUIRE_CLIENT_API_KEY=true``: this server
     holds no Neuralk key of its own, so a ``tools/call`` without one cannot do
@@ -1000,20 +1021,34 @@ class RequireClientKeyMiddleware:
     and audit tools can read the tool list before a user has configured a
     key. ``/healthz`` and the single-use ``/downloads`` links are not MCP
     requests and pass through.
+
+    With OAuth sign-in on (``oauth``), every MCP request without credentials
+    is answered ``401`` with a ``WWW-Authenticate`` challenge that points at
+    the protected resource metadata: that is how an MCP client (Claude's
+    "Sign in now") learns it has to sign the user in before anything else. An
+    expired or forged access token gets ``error="invalid_token"``, on which
+    the client refreshes it. A raw API key in a header works as without OAuth.
     """
 
     GATED_METHODS = frozenset({"tools/call"})
 
-    def __init__(self, app: Any, mcp_paths: set[str]) -> None:
+    def __init__(self, app: Any, mcp_paths: set[str], oauth: OAuthServer | None = None) -> None:
         self.app = app
         self.mcp_paths = {p.rstrip("/") or "/" for p in mcp_paths}
+        self.oauth = oauth
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] != "http" or scope.get("method") != "POST":
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "").rstrip("/") or "/"
-        if path not in self.mcp_paths or _api_key_from_headers(Headers(scope=scope)):
+        if path not in self.mcp_paths:
+            await self.app(scope, receive, send)
+            return
+        if self.oauth is not None:
+            await self._sign_in_gate(self.oauth, path, scope, receive, send)
+            return
+        if scope.get("method") != "POST" or _api_key_from_headers(Headers(scope=scope)):
             await self.app(scope, receive, send)
             return
 
@@ -1056,6 +1091,44 @@ class RequireClientKeyMiddleware:
 
         await self.app(scope, replay, send)
 
+    async def _sign_in_gate(
+        self, oauth: OAuthServer, path: str, scope: dict[str, Any], receive: Any, send: Any
+    ) -> None:
+        credential = _raw_credential(Headers(scope=scope))
+        if scope.get("method") == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        if credential and not oauth.issued(credential):
+            await self.app(scope, receive, send)  # a raw API key: checked by the tool that uses it
+            return
+        if credential:
+            # One of our blobs: a valid access token whose key Neuralk still
+            # accepts, or a 401 that makes the client refresh (and, if the key
+            # was revoked, sign in again).
+            api_key = oauth.api_key_for(credential)
+            if api_key is not None and await oauth.key_accepted(api_key):
+                await self.app(scope, receive, send)
+                return
+        invalid_token = credential is not None
+        if invalid_token:
+            body = {"error": "invalid_token", "error_description": "The access token is expired or not valid."}
+        else:
+            body = {
+                "error": "unauthorized",
+                "error_description": (
+                    "Sign in to use Seldon: add this server as a connector in your MCP client and press "
+                    f"Connect, or send your Neuralk API key as the '{API_KEY_HEADER}' header or as "
+                    "'Authorization: Bearer <key>'. Create a key at "
+                    "https://prediction.neuralk-ai.com/dashboard/api-keys."
+                ),
+            }
+        response = JSONResponse(
+            body,
+            status_code=401,
+            headers={"WWW-Authenticate": oauth.challenge(path, invalid_token=invalid_token)},
+        )
+        await response(scope, receive, send)
+
     @classmethod
     def _is_gated(cls, body: bytes) -> bool:
         """True when the JSON-RPC body (single message or batch) contains a gated method."""
@@ -1095,6 +1168,9 @@ def build_http_app(
     client given either the bare host or the ``/mcp`` URL works), ``/healthz``
     for probes and ``/downloads/<token>`` for large prediction sets. With
     ``require_client_api_key`` set, MCP requests without a key are refused.
+    With ``seldon_oauth_secret`` set, the server is also its own OAuth
+    authorization server (``seldon_mcp.oauth``) and requests without
+    credentials are sent to sign in.
 
     Args:
         host: Address the server will bind (decides the transport security).
@@ -1109,6 +1185,7 @@ def build_http_app(
     """
     from starlette.routing import Route
 
+    global _oauth
     config = _init_state()
     _configure_binding(host, port)
     mcp.settings.stateless_http = stateless
@@ -1120,8 +1197,15 @@ def build_http_app(
         mcp_route = next(r for r in app.routes if getattr(r, "path", None) == mcp_path)
         # Reuse the exact same ASGI endpoint so / behaves identically to /mcp.
         app.router.routes.append(Route("/", endpoint=mcp_route.endpoint))
-    if config.require_client_api_key:
-        app.add_middleware(RequireClientKeyMiddleware, mcp_paths={mcp_path, "/"})
+    _oauth = None
+    if config.seldon_oauth_secret:
+        # Imported here: `import seldon_mcp.server` stays fast (see the lazy imports above).
+        from seldon_mcp.oauth import OAuthServer
+
+        _oauth = OAuthServer(config)
+        app.router.routes.extend(_oauth.routes())
+    if config.require_client_api_key or _oauth is not None:
+        app.add_middleware(RequireClientKeyMiddleware, mcp_paths={mcp_path, "/"}, oauth=_oauth)
     return app
 
 
@@ -1151,6 +1235,21 @@ def _start_import_warmer() -> threading.Thread:
     return thread
 
 
+class _RedactSignInQueries(logging.Filter):
+    """Keep the query strings of the sign-in endpoints (codes, states) out of the access log."""
+
+    _PATHS = ("/authorize", "/oauth/")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn.access formats (client, method, full path, http version, status).
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            path, separator, _ = args[2].partition("?")
+            if separator and path.startswith(self._PATHS):
+                record.args = (args[0], args[1], f"{path}?…", args[3], args[4])
+        return True
+
+
 def _serve_streamable_http(
     host: str, port: int, *, stateless: bool, json_response: bool, forwarded_allow_ips: str
 ) -> None:
@@ -1158,12 +1257,15 @@ def _serve_streamable_http(
     import uvicorn
 
     app = build_http_app(host, port, stateless=stateless, json_response=json_response)
+    logging.getLogger("uvicorn.access").addFilter(_RedactSignInQueries())
     assert _download_store is not None  # built by build_http_app
     _start_download_sweeper(_download_store)
     _start_import_warmer()
     logger.info(
-        "Serving Streamable HTTP on %s:%s (stateless=%s, json_response=%s, client key required=%s)",
+        "Serving Streamable HTTP on %s:%s (stateless=%s, json_response=%s, client key required=%s, "
+        "OAuth sign-in=%s)",
         host, port, stateless, json_response, bool(_lifespan_config and _lifespan_config.require_client_api_key),
+        "off" if _oauth is None else ("Neuralk account or API key" if _oauth.neuralk_sign_in else "API key"),
     )
     uvicorn.run(
         app,

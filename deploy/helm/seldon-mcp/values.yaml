@@ -45,6 +45,12 @@ config:
 # Optional Secret loaded with envFrom — the only way a credential reaches the
 # pod. A private deployment that bills one organisation puts NEURALK_API_KEY
 # there and sets config.REQUIRE_CLIENT_API_KEY to "false".
+#
+# OAuth sign-in (a Connect button in Claude, ChatGPT...) is on when this Secret
+# holds SELDON_OAUTH_SECRET (32+ random characters; changing it signs every
+# user out). "Continue with Neuralk" also needs NEURALK_OIDC_CLIENT_SECRET
+# here and config.NEURALK_OIDC_CLIENT_ID. A Secret is not in the config
+# checksum: after editing it, `kubectl rollout restart` the deployment.
 existingSecret: ""
 
 server:

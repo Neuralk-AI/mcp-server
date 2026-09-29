@@ -6,7 +6,9 @@ Seldon MCP server — release {{ .Release.Name }} in {{ .Release.Namespace }}.
 MCP endpoint:  {{ $publicUrl }}/mcp
 Health:        {{ $publicUrl }}/healthz
 
-Connect a client with its own Neuralk API key, for example:
+With OAuth sign-in on (SELDON_OAUTH_SECRET in the release Secret), add
+{{ $publicUrl }}/mcp as a connector in Claude or ChatGPT and press Connect.
+Any client can also send its own Neuralk API key, for example:
 
   claude mcp add --transport http seldon {{ $publicUrl }}/mcp \
     --header "x-neuralk-api-key: nk_live_..."
@@ -25,6 +27,8 @@ or port-forward:
 
 {{- if eq (toString .Values.config.REQUIRE_CLIENT_API_KEY) "true" }}
 
-Every MCP request must carry the client's key (x-neuralk-api-key or
-Authorization: Bearer). Requests without one are answered 401.
+Tool calls must carry the client's credentials (an OAuth access token, or a
+key as x-neuralk-api-key or Authorization: Bearer) and are answered 401
+without. With sign-in on, so is every MCP request, which is how clients know
+to sign in; without it, discovery (initialize, tools/list) stays open.
 {{- end }}

@@ -1843,6 +1843,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "click" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
     { name = "neuralk" },
@@ -1871,6 +1872,7 @@ dev = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.5" },
     { name = "click", specifier = ">=8.0" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.2.0" },
     { name = "neuralk", specifier = ">=1.2.0" },

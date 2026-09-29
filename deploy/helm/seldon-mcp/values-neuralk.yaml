@@ -17,6 +17,16 @@ image:
 imagePullSecrets:
   - name: scaleway-registry
 
+# OAuth sign-in: SELDON_OAUTH_SECRET and NEURALK_OIDC_CLIENT_SECRET, created
+# out of band like the pull secret (deploy/README.md). It must exist before
+# the pods do.
+existingSecret: seldon-mcp-oauth
+
+config:
+  # The confidential client of the Neuralk Keycloak realm behind "Continue
+  # with Neuralk" (redirect URI https://mcp.neuralk.ai/oauth/callback).
+  NEURALK_OIDC_CLIENT_ID: seldon-mcp
+
 ingress:
   enabled: true
   host: mcp.neuralk.ai
