@@ -93,6 +93,13 @@ still works and the page only asks for an API key.
 Creating a key at sign-in needs the admin or owner role in the user's Neuralk
 organization; members are told to paste a key instead.
 
+Keycloak's login page takes a password only, which users who sign in with
+magic links don't have. Once the dashboard release with the `/connect` page is
+live, set `config.NEURALK_DASHBOARD_URL: https://prediction.neuralk.ai` in the
+Neuralk values and `helm upgrade`: "Continue with Neuralk" then goes through
+the dashboard (password or magic link), and the Keycloak client and its
+secret can go.
+
 ### 3. DNS
 
 `mcp.neuralk.ai` is an `A` record on Cloudflare, DNS-only (grey cloud), TTL 300,

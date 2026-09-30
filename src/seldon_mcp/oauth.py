@@ -4,10 +4,15 @@ A Claude user adds ``https://mcp.neuralk.ai/mcp`` as a connector and presses
 Connect; ChatGPT, Claude Code, Cursor and every MCP client that speaks the MCP
 authorization spec do the same. The server answers as its own OAuth 2.1
 authorization server: the client registers itself (RFC 7591), sends the user
-to a Neuralk page, and gets tokens back. On that page the user either signs in
-with their Neuralk account, and the server creates an API key for the
-connection, or pastes a key they already have. Either way an API key is what
-the prediction API takes, and the tokens the client holds are that key, sealed.
+to a Neuralk page, and gets tokens back. On that page the user either
+continues with their Neuralk account, or pastes a key they already have.
+"Continue with Neuralk" goes to the Neuralk dashboard's /connect page when
+NEURALK_DASHBOARD_URL is set: the user signs in there however they usually do
+(password or magic link), approves, and the dashboard creates an API key for
+the connection and posts it back here. Otherwise it signs in on the Keycloak
+realm, and this server creates the key with the user's token. Either way an
+API key is what the prediction API takes, and the tokens the client holds are
+that key, sealed.
 
 Stateless where it can be. The client registration, the pending authorization,
 the code and both tokens are AES-GCM blobs under ``SELDON_OAUTH_SECRET``: there
@@ -85,6 +90,11 @@ MIN_SECRET_LENGTH = 32
 
 CONSENT_PATH = "/oauth/consent"
 CALLBACK_PATH = "/oauth/callback"
+# The dashboard's side of "Continue with Neuralk": its /connect page asks
+# what to show (describe), then posts the key it created (complete).
+DASHBOARD_CONNECT_PATH = "/connect"
+CONNECT_DESCRIBE_PATH = "/oauth/connect/describe"
+CONNECT_COMPLETE_PATH = "/oauth/connect/complete"
 API_KEYS_URL = "https://prediction.neuralk-ai.com/dashboard/api-keys"
 DOCS_URL = "https://docs.neuralk.ai/integrations/mcp.html"
 # What a key created at sign-in may do: `read` runs inference, `write` uploads.
@@ -476,7 +486,14 @@ class OAuthServer:
         self.resource = f"{self.issuer}/mcp"
         self.sealer = Sealer(config.seldon_oauth_secret)
         self.provider = SealedProvider(self.sealer, f"{self.issuer}{CONSENT_PATH}", config)
-        self.neuralk_sign_in = bool(config.neuralk_oidc_client_id and config.neuralk_oidc_client_secret)
+        # "Continue with Neuralk": through the dashboard, else through
+        # Keycloak, else not offered (the page only takes an API key).
+        self.dashboard_url = (config.neuralk_dashboard_url or "").rstrip("/") or None
+        dashboard = urlsplit(self.dashboard_url or "")
+        self.dashboard_origin = f"{dashboard.scheme}://{dashboard.netloc}" if self.dashboard_url else None
+        keycloak = bool(config.neuralk_oidc_client_id and config.neuralk_oidc_client_secret)
+        self.sign_in_mode = "dashboard" if self.dashboard_url else ("keycloak" if keycloak else None)
+        self.neuralk_sign_in = self.sign_in_mode is not None
         https = self.issuer.startswith("https://")
         # __Host-: only this exact host can set it, so a sibling subdomain
         # cannot plant a known value (it needs Secure, hence https only).
@@ -551,6 +568,8 @@ class OAuthServer:
             Route("/register", cors_middleware(self.register, ["POST", "OPTIONS"]), methods=["POST", "OPTIONS"]),
             Route(CONSENT_PATH, self.consent, methods=["GET", "POST"]),
             Route(CALLBACK_PATH, self.callback, methods=["GET"]),
+            Route(CONNECT_DESCRIBE_PATH, self.describe, methods=["GET"]),
+            Route(CONNECT_COMPLETE_PATH, self.complete, methods=["POST"]),
         ]
 
     async def _protected_resource_metadata(self, request: Request) -> Response:
@@ -667,7 +686,9 @@ class OAuthServer:
             error = f"Please try again. If this keeps happening, allow cookies for {urlsplit(self.issuer).hostname}."
             return self._page(request, pending_token, pending, error=error, status=400)
 
-        if form.get("action") == "neuralk" and self.neuralk_sign_in:
+        if form.get("action") == "neuralk" and self.sign_in_mode == "dashboard":
+            return self._start_dashboard_sign_in(pending_token, nonce)
+        if form.get("action") == "neuralk" and self.sign_in_mode == "keycloak":
             try:
                 return await self._start_neuralk_sign_in(pending_token, nonce)
             except SignInError as exc:
@@ -732,6 +753,90 @@ class OAuthServer:
             status_code=302,
             headers={"Cache-Control": "no-store"},
         )
+
+    # --- "Continue with Neuralk": the dashboard leg ---
+
+    def _start_dashboard_sign_in(self, pending_token: str, nonce: str) -> Response:
+        """Send the user to the dashboard's /connect page, the sign-in sealed in its state."""
+        state = self.sealer.seal("upstream", {"q": pending_token, "n": nonce, "m": "dashboard"}, PENDING_TTL_S)
+        return RedirectResponse(
+            f"{self.dashboard_url}{DASHBOARD_CONNECT_PATH}?{urlencode({'state': state})}", status_code=303
+        )
+
+    def _dashboard_flow(self, request: Request, state: str | None) -> tuple[dict[str, Any], dict[str, Any]] | str:
+        """The sign-in a dashboard state stands for, or why it cannot go on.
+
+        The browser must be the one this server sent to the dashboard: the
+        sign-in cookie comes along on the dashboard's same-site requests, and
+        a link built from someone else's sign-in fails here, before any key
+        is created.
+        """
+        upstream = self.sealer.open("upstream", state)
+        pending = self.sealer.open("pending", upstream["q"]) if upstream else None
+        if upstream is None or pending is None or upstream.get("m") != "dashboard":
+            return "This sign-in link has expired. Go back to your app and press Connect again."
+        nonce = self._browser_nonce(request)
+        if nonce is None or not _same(nonce, str(upstream.get("n") or "")):
+            return (
+                "This sign-in did not start in this browser, or took too long. Go back to your app "
+                "and press Connect again."
+            )
+        return upstream, pending
+
+    def _dashboard_cors(self, request: Request) -> dict[str, str]:
+        """CORS for the dashboard's own origin only, cookies included."""
+        origin = request.headers.get("origin")
+        if not origin or origin != self.dashboard_origin:
+            return {"Vary": "Origin"}
+        return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
+
+    async def describe(self, request: Request) -> Response:
+        """What the dashboard's /connect page shows and which key it creates."""
+        headers = {**self._dashboard_cors(request), "Cache-Control": "no-store"}
+        if self.sign_in_mode != "dashboard":
+            return JSONResponse({"error": "Dashboard sign-in is not enabled."}, status_code=404, headers=headers)
+        flow = self._dashboard_flow(request, request.query_params.get("state"))
+        if isinstance(flow, str):
+            return JSONResponse({"error": flow}, status_code=400, headers=headers)
+        upstream, pending = flow
+        redirect_uri = pending["r"]
+        session_end = int(time.time()) + SESSION_TTL_S
+        return JSONResponse(
+            {
+                "app": _app_label(redirect_uri),
+                "client_name": pending.get("n"),
+                "destination": None if urlsplit(redirect_uri).scheme == "https" else redirect_uri,
+                "key": {
+                    "name": _key_name(pending),
+                    "scopes": CREATED_KEY_SCOPES,
+                    "expires_at": datetime.fromtimestamp(session_end, tz=timezone.utc).isoformat(),
+                },
+                # Back to this server's page, e.g. to paste a key instead.
+                "back_url": f"{self.issuer}{CONSENT_PATH}?{urlencode({'request': upstream['q']})}",
+            },
+            headers=headers,
+        )
+
+    async def complete(self, request: Request) -> Response:
+        """The dashboard posts the key it created (or a cancel): finish the sign-in."""
+        if self.sign_in_mode != "dashboard":
+            return _message_page("Dashboard sign-in is not enabled", "Go back to your app and try again.")
+        form = await request.form()
+        flow = self._dashboard_flow(request, str(form.get("state") or ""))
+        if isinstance(flow, str):
+            return _message_page("This sign-in did not complete", flow)
+        upstream, pending = flow
+        if form.get("action") == "cancel":
+            return RedirectResponse(
+                construct_redirect_uri(pending["r"], error="access_denied", state=pending["s"], iss=self.issuer),
+                status_code=302,
+                headers={"Cache-Control": "no-store"},
+            )
+        api_key = str(form.get("api_key") or "").strip()
+        error = "No API key came back from the dashboard." if not api_key else await self._check_key(api_key)
+        if error:
+            return self._page(request, upstream["q"], pending, error=error, status=400)
+        return self._back_to_client(pending, api_key, int(time.time()) + SESSION_TTL_S)
 
     # --- "Continue with Neuralk": the Keycloak leg ---
 
@@ -806,8 +911,7 @@ class OAuthServer:
         It expires with the sign-in, so a connection nobody reopens leaves no
         key behind for long.
         """
-        label = pending.get("n") or urlsplit(pending["r"]).hostname or "MCP client"
-        name = f"{label[:60]} connector ({datetime.now(timezone.utc):%Y-%m-%d})"
+        name = _key_name(pending)
         expires_at = datetime.fromtimestamp(session_end, tz=timezone.utc).isoformat()
         url = f"{self.config.neuralk_prediction_url.rstrip('/')}/api/v1/api-keys"
         try:
@@ -864,7 +968,7 @@ class OAuthServer:
                 cancel_url=construct_redirect_uri(
                     redirect_uri, error="access_denied", state=pending["s"], iss=self.issuer
                 ),
-                neuralk_sign_in=self.neuralk_sign_in,
+                sign_in_mode=self.sign_in_mode,
                 error=error,
                 script_nonce=script_nonce,
             ),
@@ -885,14 +989,25 @@ class OAuthServer:
         return response
 
 
+def _key_name(pending: dict[str, Any]) -> str:
+    """The name of the key created for a connection, as the dashboard lists it."""
+    label = pending.get("n") or urlsplit(pending["r"]).hostname or "MCP client"
+    return f"{label[:60]} connector ({datetime.now(timezone.utc):%Y-%m-%d})"
+
+
 def _error_message(response: httpx.Response) -> str | None:
-    """The human message of an API error body, when there is one."""
+    """The human message of an API error body, when there is one.
+
+    The platform answers ``{"detail": {"error": {"code", "message", ...}}}``;
+    a plain ``{"detail": "..."}`` is read too.
+    """
     try:
         detail = response.json().get("detail")
     except (ValueError, AttributeError):
         return None
     if isinstance(detail, dict):
-        detail = detail.get("message")
+        inner = detail.get("error")
+        detail = inner.get("message") if isinstance(inner, dict) else detail.get("message")
     return detail if isinstance(detail, str) else None
 
 
@@ -982,6 +1097,16 @@ def _document(title: str, content: str, script_nonce: str | None = None) -> str:
     )
 
 
+_SIGN_IN_HINTS = {
+    "dashboard": "Sign in to your Neuralk dashboard, with your password or a magic link, and approve: "
+    "an API key for this connection is created in your organization.",
+    # Keycloak's own login page only takes a password: say so, or an account
+    # that only ever used magic links gets stuck there.
+    "keycloak": "Uses your Neuralk email and password; an API key for this connection is created in your "
+    "organization. Only sign in with magic links? Use an API key below.",
+}
+
+
 def _consent_html(
     *,
     pending_token: str,
@@ -990,7 +1115,7 @@ def _consent_html(
     destination: str | None,
     client_name: str | None,
     cancel_url: str,
-    neuralk_sign_in: bool,
+    sign_in_mode: str | None,
     error: str | None,
     script_nonce: str,
 ) -> str:
@@ -1011,16 +1136,16 @@ def _consent_html(
         f'<input type="hidden" name="request" value="{e(pending_token)}">'
         f'<input type="hidden" name="csrf" value="{e(csrf)}">'
     )
-    if neuralk_sign_in:
+    if sign_in_mode:
+        hint = _SIGN_IN_HINTS[sign_in_mode]
         parts.append(
             f'<form method="post" action="{CONSENT_PATH}">{hidden}'
             '<button class="primary" type="submit" name="action" value="neuralk">Continue with Neuralk</button>'
-            '<p class="hint">Sign in to your Neuralk account; an API key for this connection is created '
-            "in your organization.</p></form>"
+            f'<p class="hint">{hint}</p></form>'
             '<div class="or">or use an API key</div>'
         )
-    button_class = "secondary" if neuralk_sign_in else "primary"
-    autofocus = "" if neuralk_sign_in else " autofocus"
+    button_class = "secondary" if sign_in_mode else "primary"
+    autofocus = "" if sign_in_mode else " autofocus"
     parts.append(
         f'<form method="post" action="{CONSENT_PATH}">{hidden}'
         '<label for="api_key">Neuralk API key</label>'

@@ -24,8 +24,14 @@ existingSecret: seldon-mcp-oauth
 
 config:
   # The confidential client of the Neuralk Keycloak realm behind "Continue
-  # with Neuralk" (redirect URI https://mcp.neuralk.ai/oauth/callback).
+  # with Neuralk" (redirect URI https://mcp.neuralk.ai/oauth/callback). Its
+  # login page only takes a password: the page says so to magic-link users.
   NEURALK_OIDC_CLIENT_ID: seldon-mcp
+  # "Continue with Neuralk" through the dashboard instead (password or magic
+  # link, and one click for someone already signed in to it). Uncomment once
+  # the dashboard release with the /connect page is live; it wins over the
+  # Keycloak client, which can then be deleted.
+  # NEURALK_DASHBOARD_URL: https://prediction.neuralk.ai
 
 ingress:
   enabled: true

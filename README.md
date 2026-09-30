@@ -191,7 +191,8 @@ Environment variables, or a `.env` file next to the process:
 | `SELDON_DOWNLOAD_DIR` | system temp | Where the single-use prediction files are written. |
 | `SELDON_DOWNLOAD_TTL_SECONDS` | `300` | How long they live. |
 | `SELDON_OAUTH_SECRET` | unset | Turns on OAuth sign-in (below). 32+ random characters; changing it signs every user out. Needs `SELDON_PUBLIC_URL`. |
-| `NEURALK_OIDC_CLIENT_ID` | unset | Keycloak client behind "Continue with Neuralk". Unset (or no secret), the sign-in page only takes an API key. |
+| `NEURALK_DASHBOARD_URL` | unset | "Continue with Neuralk" through the dashboard's `/connect` page (password or magic link). Wins over the Keycloak client. |
+| `NEURALK_OIDC_CLIENT_ID` | unset | Keycloak client behind "Continue with Neuralk" when there is no dashboard URL. Unset (or no secret), the sign-in page only takes an API key. |
 | `NEURALK_OIDC_CLIENT_SECRET` | unset | That client's secret. |
 | `NEURALK_OIDC_ISSUER` | `https://auth.neuralk-ai.com/realms/Neuralk` | The Neuralk Keycloak realm. |
 | `SKIP_API_KEY_VALIDATION` | `false` | Skip the upfront key check (not recommended). |
@@ -210,9 +211,18 @@ server, the flow MCP clients run on their own: a request without credentials
 gets a `401` pointing at `/.well-known/oauth-protected-resource/mcp`, the
 client registers itself (`/register`, RFC 7591), sends the user to
 `/authorize` with PKCE, and exchanges the code at `/token`. The page in
-between (`/oauth/consent`) signs the user in on the Neuralk Keycloak realm and
-creates an API key for the connection (`POST /api/v1/api-keys`, scopes
-`read` + `write`), or takes a key the user pastes.
+between (`/oauth/consent`) takes a key the user pastes, or "Continue with
+Neuralk":
+
+- With `NEURALK_DASHBOARD_URL`, the user goes to the dashboard's `/connect`
+  page, signs in there as usual (password or magic link), and approves. The
+  dashboard reads what to show from `/oauth/connect/describe`, creates the key
+  with the user's session (`POST /api/v1/api-keys`, scopes `read` + `write`),
+  and posts it to `/oauth/connect/complete`. Both calls carry this server's
+  sign-in cookie (the dashboard is on the same site), so a dashboard link built
+  from someone else's sign-in creates nothing.
+- Otherwise, the user signs in on the Neuralk Keycloak realm (password only)
+  and this server creates the key with the user's token.
 
 Nothing is stored. The client id, the code and both tokens are AES-GCM blobs
 under `SELDON_OAUTH_SECRET` that carry what they need, the API key included:
