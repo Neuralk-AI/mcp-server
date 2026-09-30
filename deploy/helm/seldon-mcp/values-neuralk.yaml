@@ -10,7 +10,7 @@ image:
   # Built by .github/workflows/image.yml (linux/amd64). Every build of main
   # carries a main-<sha> tag, so this line maps to a commit and a rollback is a
   # line in a diff. Pin releases here; never deploy :latest.
-  tag: main-30c347f
+  tag: main-953169a
 
 # rg.fr-par.scw.cloud/neuralk-prod is PRIVATE. This secret must exist in the
 # release namespace before the pods do (deploy/README.md).
