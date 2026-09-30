@@ -7,11 +7,16 @@ How `https://mcp.neuralk.ai` is run, and how to run another one. The chart is
 ## What it is
 
 One stateless process behind the cluster's nginx ingress. It holds **no Neuralk
-key**: every MCP request carries the client's own key
-(`REQUIRE_CLIENT_API_KEY=true`), the server validates it against the prediction
-API and forwards the work. A tool call without a key is answered `401` before it
-reaches the tool; discovery (`initialize`, `tools/list`) stays open. The server writes one kind of file — the single-use prediction
-CSVs behind `/downloads/<token>` — into an emptyDir that lives five minutes.
+key**: every MCP request carries the client's own credentials
+(`REQUIRE_CLIENT_API_KEY=true`), the server validates them against the
+prediction API and forwards the work. Users connect from Claude or ChatGPT
+with a Connect button (OAuth sign-in, `SELDON_OAUTH_SECRET`): the server is its
+own authorization server, signs them in on the Neuralk Keycloak realm and
+creates an API key for the connection. Clients that don't do OAuth send a key
+in a header. An MCP request without credentials is answered `401` with the
+challenge that starts sign-in. The server writes one kind of file — the
+single-use prediction CSVs behind `/downloads/<token>` — into an emptyDir that
+lives five minutes.
 
 Because those files are pod-local, the chart runs **one replica** and refuses
 to render more unless `downloads.existingClaim` names a ReadWriteMany volume
@@ -55,6 +60,39 @@ kubectl -n "$NS" create secret docker-registry scaleway-registry \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
+### 2b. The sign-in secret and the Keycloak client
+
+"Continue with Neuralk" signs users in through a confidential client of the
+`Neuralk` realm. Create it once in the Keycloak admin console
+(`https://auth.neuralk-ai.com/admin/master/console/#/Neuralk/clients`):
+
+| Setting | Value |
+|---|---|
+| Client ID | `seldon-mcp` (what `config.NEURALK_OIDC_CLIENT_ID` names) |
+| Client authentication | On (confidential) |
+| Authentication flow | Standard flow only (no direct access grants, no implicit) |
+| Valid redirect URIs | `https://mcp.neuralk.ai/oauth/callback` |
+| Web origins | empty |
+| Advanced → PKCE method | `S256` |
+
+Copy the secret from its **Credentials** tab, then put both secrets in the
+release Secret. `SELDON_OAUTH_SECRET` seals every token the server hands out:
+changing it signs every user out, so generate it once and keep it.
+
+```bash
+kubectl -n "$NS" create secret generic seldon-mcp-oauth \
+  --from-literal=SELDON_OAUTH_SECRET="$(openssl rand -base64 48)" \
+  --from-literal=NEURALK_OIDC_CLIENT_SECRET='<the seldon-mcp client secret>'
+```
+
+The Secret must exist before the pods (they fail to start without it). A
+change to it is not in the config checksum: `kubectl -n "$NS" rollout restart
+deploy/seldon-mcp` to apply it. Without `NEURALK_OIDC_CLIENT_SECRET`, sign-in
+still works and the page only asks for an API key.
+
+Creating a key at sign-in needs the admin or owner role in the user's Neuralk
+organization; members are told to paste a key instead.
+
 ### 3. DNS
 
 `mcp.neuralk.ai` is an `A` record on Cloudflare, DNS-only (grey cloud), TTL 300,
@@ -84,7 +122,9 @@ kubectl -n seldon-mcp get certificate,pods,ingress
 
 ```bash
 curl -fsS https://mcp.neuralk.ai/healthz                       # ok
-curl -s -o /dev/null -w '%{http_code}\n' -X POST https://mcp.neuralk.ai/mcp   # 401: no key
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://mcp.neuralk.ai/mcp   # 401: no credentials
+curl -s -D - -o /dev/null -X POST https://mcp.neuralk.ai/mcp | grep -i www-authenticate   # resource_metadata=...
+curl -fsS https://mcp.neuralk.ai/.well-known/oauth-authorization-server        # the OAuth metadata
 # a real MCP handshake, with a key
 curl -s https://mcp.neuralk.ai/mcp \
   -H "x-neuralk-api-key: $NEURALK_API_KEY" \
@@ -93,7 +133,9 @@ curl -s https://mcp.neuralk.ai/mcp \
 ```
 
 Then, from a client: `claude mcp add --transport http seldon https://mcp.neuralk.ai/mcp --header "x-neuralk-api-key: $NEURALK_API_KEY"`
-and call `list_models`.
+and call `list_models`. For sign-in, add `https://mcp.neuralk.ai/mcp` as a
+custom connector in Claude (Settings → Connectors), press Connect, and go
+through "Continue with Neuralk".
 
 ## Upgrading
 
@@ -103,6 +145,14 @@ and call `list_models`.
 3. `helm upgrade` as above. A rollback is the previous tag and the same command.
 
 ## What can go wrong
+
+- **Pods stuck in `CreateContainerConfigError`**: the `seldon-mcp-oauth` Secret
+  is missing (step 2b).
+- **"Neuralk sign-in did not complete"** on the sign-in page: Keycloak refused
+  the code exchange. Check the client secret in the Secret and the redirect
+  URI of the `seldon-mcp` client; the pod logs the status Keycloak answered.
+- **Everyone signed out at once**: `SELDON_OAUTH_SECRET` changed. Users press
+  Connect again.
 
 - **`421` or "Invalid Host header"** from the pod: the process was started on a
   loopback host with FastMCP's DNS-rebinding protection on. The chart binds

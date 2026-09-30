@@ -25,6 +25,8 @@ dependencies = [
     "zstandard>=0.22",
     "numpy>=1.26",
     "uvicorn>=0.31",
+    # AES-GCM sealing of the OAuth tokens (seldon_mcp.oauth).
+    "cryptography>=42",
 ]
 
 [project.scripts]

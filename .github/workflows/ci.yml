@@ -120,6 +120,44 @@ jobs:
           test "$code" = "401" || { echo "expected 401 for a tool call without a key, got $code"; docker logs mcp; exit 1; }
           docker rm -f mcp
 
+      - name: With OAuth sign-in on, a request without credentials is sent to sign in
+        # The same image and command, plus the OAuth secret: every MCP request
+        # without credentials gets a 401 whose challenge points at the
+        # protected resource metadata, and the authorization server answers.
+        run: |
+          read -r -a CMD <<< "$(helm template seldon-mcp deploy/helm/seldon-mcp -f deploy/helm/seldon-mcp/values-neuralk.yaml \
+            | python3 -c '
+          import sys, yaml
+          for doc in yaml.safe_load_all(sys.stdin):
+              if doc and doc.get("kind") == "Deployment":
+                  c = doc["spec"]["template"]["spec"]["containers"][0]
+                  print(" ".join(c.get("command", []) + c.get("args", [])))
+          ')"
+          docker run -d --name mcp-oauth -p 8001:8000 --read-only --tmpfs /tmp --user 10001:10001 \
+            -e REQUIRE_CLIENT_API_KEY=true -e SELDON_PUBLIC_URL=http://localhost:8001 \
+            -e SELDON_OAUTH_SECRET="$(openssl rand -base64 48)" \
+            --entrypoint "${CMD[0]}" seldon-mcp:ci "${CMD[@]:1}"
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8001/healthz && break
+            sleep 1
+          done
+          fail() { echo "$1"; docker logs mcp-oauth; exit 1; }
+          headers=$(curl -s -o /dev/null -D - -X POST http://127.0.0.1:8001/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
+          echo "$headers" | grep -q '^HTTP/1.1 401' || fail "expected 401 for initialize without credentials"
+          echo "$headers" | grep -qi 'resource_metadata="http://localhost:8001/.well-known/oauth-protected-resource/mcp"' \
+            || fail "the 401 does not point at the protected resource metadata"
+          curl -fsS http://127.0.0.1:8001/.well-known/oauth-protected-resource/mcp | grep -q '"resource":"http://localhost:8001/mcp"' \
+            || fail "protected resource metadata missing or wrong"
+          curl -fsS http://127.0.0.1:8001/.well-known/oauth-authorization-server | grep -q '"registration_endpoint"' \
+            || fail "authorization server metadata missing"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8001/register \
+            -H 'Content-Type: application/json' \
+            -d '{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"token_endpoint_auth_method":"none"}')
+          test "$code" = "201" || fail "expected 201 from /register, got $code"
+          docker rm -f mcp-oauth
+
   helm:
     # The chart renders with the production values, and lints clean.
     runs-on: ubuntu-latest
@@ -136,9 +174,11 @@ jobs:
 
       - name: The chart refuses a credential in values
         run: |
-          if helm template seldon-mcp deploy/helm/seldon-mcp --set config.NEURALK_API_KEY=x > /dev/null 2>&1; then
-            echo "chart rendered with a credential under config"; exit 1
-          fi
+          for key in NEURALK_API_KEY SELDON_OAUTH_SECRET NEURALK_OIDC_CLIENT_SECRET; do
+            if helm template seldon-mcp deploy/helm/seldon-mcp --set config.$key=x > /dev/null 2>&1; then
+              echo "chart rendered with a credential under config ($key)"; exit 1
+            fi
+          done
           if helm template seldon-mcp deploy/helm/seldon-mcp --set replicaCount=2 > /dev/null 2>&1; then
             echo "chart rendered two replicas with pod-local downloads"; exit 1
           fi
