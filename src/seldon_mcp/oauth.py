@@ -996,13 +996,18 @@ def _key_name(pending: dict[str, Any]) -> str:
 
 
 def _error_message(response: httpx.Response) -> str | None:
-    """The human message of an API error body, when there is one."""
+    """The human message of an API error body, when there is one.
+
+    The platform answers ``{"detail": {"error": {"code", "message", ...}}}``;
+    a plain ``{"detail": "..."}`` is read too.
+    """
     try:
         detail = response.json().get("detail")
     except (ValueError, AttributeError):
         return None
     if isinstance(detail, dict):
-        detail = detail.get("message")
+        inner = detail.get("error")
+        detail = inner.get("message") if isinstance(inner, dict) else detail.get("message")
     return detail if isinstance(detail, str) else None
 
 

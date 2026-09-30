@@ -705,7 +705,9 @@ class TestNeuralkSignIn:
 
     def test_member_without_key_rights_is_told_to_paste_a_key(self, app_with_neuralk_sign_in, neuralk):
         neuralk.create_status = 403
-        neuralk.create_body = {"detail": {"message": "Insufficient role"}}
+        neuralk.create_body = {
+            "detail": {"error": {"code": 4030104, "message": "Insufficient role for key management"}}
+        }
         client = app_with_neuralk_sign_in
         _, _, kc = self._to_keycloak(client)
         page = client.get("/oauth/callback", params={"code": "kc-code", "state": kc["state"]})
@@ -715,7 +717,11 @@ class TestNeuralkSignIn:
 
     def test_expired_trial_message_is_shown(self, app_with_neuralk_sign_in, neuralk):
         neuralk.create_status = 403
-        neuralk.create_body = {"detail": {"message": "Organization trial has expired. Please upgrade to continue."}}
+        neuralk.create_body = {
+            "detail": {
+                "error": {"code": 4030110, "message": "Organization trial has expired. Please upgrade to continue."}
+            }
+        }
         client = app_with_neuralk_sign_in
         _, _, kc = self._to_keycloak(client)
         page = client.get("/oauth/callback", params={"code": "kc-code", "state": kc["state"]})
