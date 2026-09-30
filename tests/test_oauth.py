@@ -759,6 +759,145 @@ class TestNeuralkSignIn:
         assert "Paste your Neuralk API key" in response.text
 
 
+# --- "Continue with Neuralk" through the dashboard ---
+
+DASHBOARD = "https://dash.test"
+
+
+@pytest.fixture
+def app_with_dashboard(monkeypatch, neuralk):
+    client, _ = _make_app(
+        _config(
+            neuralk_dashboard_url=DASHBOARD + "/",
+            # The dashboard wins over a Keycloak client configured alongside.
+            neuralk_oidc_client_id="seldon-mcp",
+            neuralk_oidc_client_secret="kc-secret",
+        ),
+        monkeypatch,
+    )
+    return client
+
+
+class TestDashboardSignIn:
+    def _to_dashboard(self, client: TestClient, state: str = "st-d") -> tuple[dict, str]:
+        registered = _register(client)
+        pending = _authorize(client, registered["client_id"], state=state)
+        page = client.get("/oauth/consent", params={"request": pending}).text
+        assert "password or a magic link" in page
+        csrf = _open_page(client, pending)
+        response = client.post(
+            "/oauth/consent", data={"request": pending, "action": "neuralk", "csrf": csrf}, follow_redirects=False
+        )
+        assert response.status_code == 303, response.text
+        location = response.headers["location"]
+        assert location.startswith(f"{DASHBOARD}/connect?state=seldon_up_")
+        return registered, _query(location)["state"]
+
+    def _describe(self, client: TestClient, state: str, origin: str = DASHBOARD):
+        return client.get("/oauth/connect/describe", params={"state": state}, headers={"Origin": origin})
+
+    def test_describe_tells_the_dashboard_what_to_show(self, app_with_dashboard):
+        client = app_with_dashboard
+        _, state = self._to_dashboard(client)
+        response = self._describe(client, state)
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == DASHBOARD
+        assert response.headers["access-control-allow-credentials"] == "true"
+        body = response.json()
+        assert body["app"] == "claude.ai"
+        assert body["client_name"] == "Claude"
+        assert body["destination"] is None
+        assert body["key"]["scopes"] == ["read", "write"]
+        assert body["key"]["name"].startswith("Claude connector (")
+        expires = datetime.fromisoformat(body["key"]["expires_at"]).timestamp()
+        assert abs(expires - (time.time() + oauth_mod.SESSION_TTL_S)) < 60
+        assert body["back_url"].startswith(f"{PUBLIC}/oauth/consent?request=seldon_req_")
+
+    def test_describe_for_another_origin_is_not_readable(self, app_with_dashboard):
+        client = app_with_dashboard
+        _, state = self._to_dashboard(client)
+        response = self._describe(client, state, origin="https://evil.example")
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_describe_in_another_browser_is_refused(self, app_with_dashboard):
+        # A dashboard link built from someone else's sign-in: nothing to show,
+        # so the dashboard creates no key.
+        client = app_with_dashboard
+        _, state = self._to_dashboard(client)
+        client.cookies.clear()
+        response = self._describe(client, state)
+        assert response.status_code == 400
+        assert "did not start in this browser" in response.json()["error"]
+
+    def test_complete_with_the_created_key(self, app_with_dashboard, neuralk):
+        client = app_with_dashboard
+        registered, state = self._to_dashboard(client)
+        neuralk.valid_keys.add("nk_live_from_dashboard")
+        back = client.post(
+            "/oauth/connect/complete",
+            data={"state": state, "api_key": "nk_live_from_dashboard"},
+            follow_redirects=False,
+        )
+        assert back.status_code == 302, back.text
+        answer = _query(back.headers["location"])
+        assert back.headers["location"].startswith(REDIRECT + "?")
+        assert answer["state"] == "st-d"
+        tokens = _exchange(client, registered["client_id"], answer["code"]).json()
+        response = client.post("/mcp", json=INIT, headers={"Authorization": f"Bearer {tokens['access_token']}"})
+        assert response.json() == {"key": "nk_live_from_dashboard"}
+
+    def test_complete_with_a_rejected_key(self, app_with_dashboard):
+        client = app_with_dashboard
+        _, state = self._to_dashboard(client)
+        response = client.post(
+            "/oauth/connect/complete", data={"state": state, "api_key": "nk_live_bad"}, follow_redirects=False
+        )
+        assert response.status_code == 400
+        assert "rejected" in response.text
+        assert 'name="api_key"' in response.text  # back on the sign-in page
+
+    def test_cancel_returns_access_denied(self, app_with_dashboard):
+        client = app_with_dashboard
+        _, state = self._to_dashboard(client)
+        back = client.post(
+            "/oauth/connect/complete", data={"state": state, "action": "cancel"}, follow_redirects=False
+        )
+        assert back.status_code == 302
+        assert _query(back.headers["location"])["error"] == "access_denied"
+
+    def test_complete_in_another_browser_is_refused(self, app_with_dashboard):
+        client = app_with_dashboard
+        _, state = self._to_dashboard(client)
+        client.cookies.clear()
+        response = client.post(
+            "/oauth/connect/complete", data={"state": state, "api_key": GOOD_KEY}, follow_redirects=False
+        )
+        assert response.status_code == 400
+        assert "location" not in response.headers
+
+    def test_a_keycloak_state_is_not_a_dashboard_state(self, app_with_dashboard):
+        client = app_with_dashboard
+        registered = _register(client)
+        pending = _authorize(client, registered["client_id"])
+        _open_page(client, pending)
+        nonce = client.cookies.get("__Host-seldon_signin")
+        sealer = Sealer(SECRET)
+        keycloak_state = sealer.seal("upstream", {"q": pending, "v": "x", "n": nonce}, 600)
+        assert self._describe(client, keycloak_state).status_code == 400
+
+    def test_endpoints_off_without_a_dashboard(self, app):
+        assert app.get("/oauth/connect/describe", params={"state": "x"}).status_code == 404
+        assert app.post("/oauth/connect/complete", data={"state": "x"}).status_code == 400
+
+
+def test_keycloak_mode_warns_magic_link_accounts(app_with_neuralk_sign_in):
+    client = app_with_neuralk_sign_in
+    registered = _register(client)
+    pending = _authorize(client, registered["client_id"])
+    page = client.get("/oauth/consent", params={"request": pending}).text
+    assert "Only sign in with magic links? Use an API key below." in page
+
+
 # --- building blocks ---
 
 

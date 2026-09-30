@@ -43,6 +43,11 @@ class SeldonConfig(BaseSettings):
     neuralk_oidc_issuer: str = "https://auth.neuralk-ai.com/realms/Neuralk"
     neuralk_oidc_client_id: str | None = None
     neuralk_oidc_client_secret: str | None = None
+    # "Continue with Neuralk" through the Neuralk dashboard instead, e.g.
+    # https://prediction.neuralk.ai: the user signs in there however they
+    # usually do (password or magic link) and approves on its /connect page,
+    # which creates the key. Takes precedence over the Keycloak client.
+    neuralk_dashboard_url: str | None = None
 
     @property
     def public_url(self) -> str | None:
