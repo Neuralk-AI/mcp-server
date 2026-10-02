@@ -28,10 +28,11 @@ config:
   # login page only takes a password: the page says so to magic-link users.
   NEURALK_OIDC_CLIENT_ID: seldon-mcp
   # "Continue with Neuralk" through the dashboard instead (password or magic
-  # link, and one click for someone already signed in to it). Uncomment once
-  # the dashboard release with the /connect page is live; it wins over the
-  # Keycloak client, which can then be deleted.
-  # NEURALK_DASHBOARD_URL: https://prediction.neuralk.ai
+  # link, and one click for someone already signed in to it). It wins over
+  # the Keycloak client above, which can be deleted once this has run a while.
+  # prediction.neuralk.ai, not .neuralk-ai.com: the dashboard must be on the
+  # same site as this server for the sign-in cookie to come along.
+  NEURALK_DASHBOARD_URL: https://prediction.neuralk.ai
 
 ingress:
   enabled: true
