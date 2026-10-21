@@ -32,6 +32,32 @@ jobs:
       - name: Run tests
         run: uv run pytest tests/ -v
 
+  readme-install:
+    # The README's install line, `uvx --from git+https://github.com/Neuralk-AI/mcp-server seldon-mcp`,
+    # resolves dependencies fresh from pyproject.toml and never reads uv.lock.
+    # A new major release of a dependency can break it while `uv sync` and the
+    # jobs above stay green on the locked versions. This runs the same command
+    # against the commit under test and checks the server answers over stdio.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install the way the README does
+        # --help loads seldon_mcp.server, so a broken import fails here.
+        run: uvx --from "git+file://${GITHUB_WORKSPACE}@$(git rev-parse HEAD)" seldon-mcp --help
+
+      - name: The installed server answers initialize over stdio
+        env:
+          NEURALK_API_KEY: ""
+        run: |
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+          out=$(echo "$init" | timeout 120 uvx --from "git+file://${GITHUB_WORKSPACE}@$(git rev-parse HEAD)" seldon-mcp)
+          echo "$out"
+          echo "$out" | grep -q '"serverInfo"' || { echo "seldon-mcp did not answer initialize"; exit 1; }
+
   build:
     runs-on: ubuntu-latest
     needs: [lint, test]
